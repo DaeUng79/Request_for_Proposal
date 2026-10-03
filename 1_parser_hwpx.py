@@ -4,6 +4,8 @@ import json
 import re
 import zipfile
 import argparse
+import os
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -13,9 +15,6 @@ HP = "http://www.hancom.co.kr/hwpml/2011/paragraph"
 HS = "http://www.hancom.co.kr/hwpml/2011/section"
 HH = "http://www.hancom.co.kr/hwpml/2011/head"
 HC = "http://www.hancom.co.kr/hwpml/2011/core"
-PAGE_NUMBER_TAG = f"{{{HP}}}pageNum"
-PAGE_HIDING_TAG = f"{{{HP}}}pageHiding"
-NEW_NUMBER_TAG = f"{{{HP}}}newNum"
 PIC_TAG = f"{{{HP}}}pic"
 IMG_TAG = f"{{{HC}}}img"
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*-?\s*(\d+)\s*-?\s*$")
@@ -46,72 +45,6 @@ def text_from_cell(cell) -> str:
     return "\n".join(paragraphs)
 
 
-def extract_page_number(paragraph) -> int | None:
-    """문단에 명시된 쪽번호가 있으면 추출하고 없으면 None을 반환한다."""
-
-    text = "".join(
-        node.text or ""
-        for node in paragraph.iter(f"{{{HP}}}t")
-    )
-    match = PAGE_NUMBER_PATTERN.match(text)
-
-    return int(match.group(1)) if match else None
-
-
-def first_line_vertical_position(paragraph) -> int | None:
-    """문단의 첫 줄이 페이지에서 시작하는 세로 위치를 반환한다."""
-
-    line = paragraph.find(f"{{{HP}}}linesegarray/{{{HP}}}lineseg")
-    if line is None:
-        return None
-
-    try:
-        return int(line.get("vertpos", ""))
-    except ValueError:
-        return None
-
-
-def page_number_restart(paragraph) -> int | None:
-    """문단에 있는 '새 쪽번호 시작' PAGE 필드의 값을 반환한다."""
-
-    for node in paragraph.iter(NEW_NUMBER_TAG):
-        if node.get("numType") != "PAGE":
-            continue
-        try:
-            return int(node.get("num", ""))
-        except (TypeError, ValueError):
-            continue
-
-    return None
-
-
-def page_hiding_value(paragraph) -> bool | None:
-    """문단에서 쪽번호 숨김 설정을 읽는다.
-
-    pageHiding은 설정이 있는 문단의 페이지에 적용되므로, 설정이 없는
-    문단에서는 None을 반환해 이전 상태를 유지할 수 있게 한다.
-    """
-
-    hiding_nodes = list(paragraph.iter(PAGE_HIDING_TAG))
-    if not hiding_nodes:
-        return None
-
-    return hiding_nodes[-1].get("hidePageNum") == "1"
-
-
-def section_start_page_number(sec) -> int | None:
-    """섹션의 secPr/startNum에 지정된 시작 쪽번호를 읽는다."""
-
-    start_num = sec.find(f".//{{{HP}}}secPr/{{{HP}}}startNum")
-    if start_num is None:
-        return None
-
-    try:
-        return int(start_num.get("page", ""))
-    except (TypeError, ValueError):
-        return None
-
-
 def find_binary_path(zip_names: set[str], binary_item_id: str | None) -> str | None:
     """binaryItemIDRef에 대응하는 HWPX BinData 경로를 찾는다."""
 
@@ -131,7 +64,7 @@ def parse_image(
     pic,
     image_id: str,
     page_number: int | None,
-    physical_page_number: int,
+    physical_page_number: int | None,
     page_number_source: str,
     source_path: str | None,
 ) -> dict[str, Any]:
@@ -199,7 +132,7 @@ def parse_table(
     table_id: str,
     border_fill_colors: dict[str, str],
     page_number: int | None,
-    physical_page_number: int,
+    physical_page_number: int | None,
     page_number_source: str,
 ) -> dict[str, Any]:
     """
@@ -328,17 +261,122 @@ def page_number_from_render_tree(page_tree: dict[str, Any]) -> int | None:
             yield from visit(child)
 
     for footer in visit(page_tree):
-        match = PAGE_NUMBER_PATTERN.fullmatch(render_node_text(footer).strip())
-        if match:
-            return int(match.group(1))
+        # 바닥글에 문서명 등이 함께 있어도 독립된 쪽번호 줄을 읽는다.
+        for line in footer.get("children", []):
+            match = PAGE_NUMBER_PATTERN.fullmatch(render_node_text(line).strip())
+            if match:
+                return int(match.group(1))
     return None
+
+
+def section_files_in_order(names) -> list[str]:
+    return sorted(
+        (name for name in names if re.fullmatch(r"Contents/section\d+\.xml", name)),
+        key=lambda name: int(re.search(r"section(\d+)", name).group(1)),
+    )
+
+
+def rendered_section_index(document, page_index: int) -> int:
+    """Python bridge에 아직 없는 getPageInfo WASM API를 좁게 감싼다."""
+    engine = document._engine
+    get_info = engine._exports.get("hwpdocument_getPageInfo")
+    if get_info is None:
+        raise RuntimeError("구역별 페이지 매핑을 지원하는 pyhwpxlib이 필요합니다.")
+    ptr, length, _, failed = get_info(engine._store, document._handle, page_index)
+    if failed:
+        raise RuntimeError(f"{page_index + 1}쪽의 구역 정보를 읽을 수 없습니다.")
+    try:
+        return int(json.loads(engine._mem_read(ptr, length))["sectionIndex"])
+    finally:
+        document._wb_free(engine._store, ptr, length, 1)
+
+
+def read_rendered_pagination(
+    path: Path, rendered_document=None,
+) -> tuple[dict[int, list[int]], list[dict[str, Any]]]:
+    """전역 문단 인덱스→실제 페이지 목록과 하단에 표시된 쪽번호를 읽는다."""
+    try:
+        from pyhwpxlib.rhwp_bridge import RhwpEngine
+    except ImportError as error:
+        raise RuntimeError("정확한 쪽번호를 읽으려면 pyhwpxlib이 필요합니다.") from error
+
+    offsets = []
+    offset = 0
+    with zipfile.ZipFile(path) as archive:
+        for name in section_files_in_order(archive.namelist()):
+            offsets.append(offset)
+            section = ET.fromstring(archive.read(name))
+            if section.tag != f"{{{HS}}}sec":
+                section = section.find(f".//{{{HS}}}sec")
+            if section is not None:
+                offset += len(section.findall(f"./{{{HP}}}p"))
+
+    renderer = rendered_document or RhwpEngine().load(str(path))
+    page_map: dict[int, list[int]] = {}
+    pages = []
+    try:
+        for page_index in range(renderer.page_count):
+            physical_page = page_index + 1
+            tree = renderer.get_page_render_tree(page_index)
+            section_index = rendered_section_index(renderer, page_index)
+            section_offset = offsets[section_index]
+            printed_number = page_number_from_render_tree(tree)
+            pages.append({
+                "physical_page_number": physical_page,
+                "page_number": printed_number,
+                "page_number_source": "rendered_footer" if printed_number is not None else "page_number_unavailable",
+            })
+
+            def collect(node):
+                if node.get("type") in ("Header", "Footer", "PageBg"):
+                    return
+                paragraph_index = node.get("pi")
+                if paragraph_index is not None:
+                    index = section_offset + int(paragraph_index)
+                    mapped = page_map.setdefault(index, [])
+                    if physical_page not in mapped:
+                        mapped.append(physical_page)
+                    # 셀 내부의 pi는 별도 번호이므로 부모 표의 페이지를 사용한다.
+                    return
+                for child in node.get("children", []):
+                    collect(child)
+
+            collect(tree)
+    finally:
+        if rendered_document is None:
+            renderer.close()
+    return page_map, pages
+
+
+def apply_rendered_pagination(
+    document: dict[str, Any],
+    page_map: dict[int, list[int]],
+    pages: list[dict[str, Any]],
+) -> None:
+    """단일 번호는 시작 페이지, 여러 쪽에 걸친 요소는 페이지 목록도 저장한다."""
+    page_lookup = {page["physical_page_number"]: page for page in pages}
+    document["pages"] = pages
+    document["pagination_source"] = "render_tree"
+    for block in document["blocks"]:
+        mapped = page_map.get(block.get("source_paragraph_index"), [])
+        metadata = dict(page_lookup[mapped[0]]) if mapped else {
+            "physical_page_number": None,
+            "page_number": None,
+            "page_number_source": "page_number_unavailable",
+        }
+        metadata["physical_page_numbers"] = list(mapped)
+        metadata["page_numbers"] = [page_lookup[page]["page_number"] for page in mapped]
+        block.update(metadata)
+        for key in ("table", "image"):
+            if key in block:
+                block[key].update(metadata)
 
 
 def parse_rendered_table(
     node: dict[str, Any],
     table_id: str,
     page_number: int | None,
-    physical_page_number: int,
+    physical_page_number: int | None,
 ) -> dict[str, Any]:
     """pyhwpxlib이 제공하는 HWP 표 셀 구조를 파싱한다."""
 
@@ -543,20 +581,15 @@ def parse_hwpx(path: str | Path) -> dict[str, Any]:
         border_fill_colors = parse_border_fill_colors(header)
         zip_names = set(z.namelist())
 
-        section_files = sorted(
-            name
-            for name in z.namelist()
-            if name.startswith("Contents/section")
-            and name.endswith(".xml")
-        )
+        section_files = section_files_in_order(z.namelist())
 
         block_index = 0
         table_index = 0
         image_index = 0
         source_paragraph_offset = 0
-        physical_page_number = 0
-        printed_page_number: int | None = None
-        page_number_configured = False
+        physical_page_number = None
+        page_number = None
+        page_number_source = "page_number_unavailable"
 
         for section_file in section_files:
 
@@ -568,11 +601,12 @@ def parse_hwpx(path: str | Path) -> dict[str, Any]:
             if sec is None:
                 continue
 
-            direct_paragraphs = set(sec.findall(f"./{{{HP}}}p"))
-            source_paragraph_indices = {
-                paragraph: source_paragraph_offset + index
-                for index, paragraph in enumerate(sec.findall(f"./{{{HP}}}p"))
-            }
+            direct_paragraphs = sec.findall(f"./{{{HP}}}p")
+            source_paragraph_indices = {}
+            for index, paragraph in enumerate(direct_paragraphs):
+                # 중첩 표도 바깥 본문 문단의 페이지를 상속한다.
+                for descendant in paragraph.iter(f"{{{HP}}}p"):
+                    source_paragraph_indices[descendant] = source_paragraph_offset + index
             paragraphs = []
 
             for paragraph in sec.iter(f"{{{HP}}}p"):
@@ -584,62 +618,7 @@ def parse_hwpx(path: str | Path) -> dict[str, Any]:
                 if paragraph in direct_paragraphs or has_table:
                     paragraphs.append(paragraph)
 
-            section_start_number = section_start_page_number(sec)
-            previous_vertical_position: int | None = None
-            page_hidden = False
-
-            # HWPX의 본문 흐름에 존재하는 top-level paragraph
-            for paragraph_index, p in enumerate(paragraphs):
-                current_vertical_position = first_line_vertical_position(p)
-                automatic_page_break = (
-                    current_vertical_position is not None
-                    and previous_vertical_position is not None
-                    and current_vertical_position < previous_vertical_position
-                )
-                starts_new_page = (
-                    paragraph_index == 0
-                    or p.get("pageBreak") == "1"
-                    or automatic_page_break
-                )
-
-                if starts_new_page:
-                    physical_page_number += 1
-                    page_hidden = False
-
-                    if printed_page_number is None:
-                        printed_page_number = section_start_number
-                        if printed_page_number is None:
-                            printed_page_number = physical_page_number
-                    elif paragraph_index != 0 or section_file != section_files[0]:
-                        printed_page_number += 1
-
-                if section_start_number is not None and paragraph_index == 0:
-                    printed_page_number = section_start_number
-
-                restart_number = page_number_restart(p)
-                if restart_number is not None:
-                    printed_page_number = restart_number
-
-                if p.find(f".//{PAGE_NUMBER_TAG}") is not None:
-                    page_number_configured = True
-
-                hiding_value = page_hiding_value(p)
-                if hiding_value is not None:
-                    page_hidden = hiding_value
-
-                if page_number_configured:
-                    page_number = None if page_hidden else printed_page_number
-                    page_number_source = (
-                        "page_number_hidden"
-                        if page_hidden
-                        else "page_number_field"
-                    )
-                else:
-                    # HWPX에 인쇄 쪽번호 필드가 없으면 실제 문서 쪽번호도
-                    # 없는 것으로 둔다. 물리 페이지 위치는 별도 필드로 보존한다.
-                    page_number = None
-                    page_number_source = "page_number_unavailable"
-
+            for p in paragraphs:
                 paragraph_parts = []
 
                 for run in p.findall(f"./{{{HP}}}run"):
@@ -774,10 +753,10 @@ def parse_hwpx(path: str | Path) -> dict[str, Any]:
                         }
                     )
 
-                previous_vertical_position = current_vertical_position
+            source_paragraph_offset += len(direct_paragraphs)
 
-            source_paragraph_offset += len(source_paragraph_indices)
-
+    page_map, pages = read_rendered_pagination(path)
+    apply_rendered_pagination(document, page_map, pages)
     add_table_context(document)
 
     return document
@@ -786,6 +765,9 @@ def parse_hwpx(path: str | Path) -> dict[str, Any]:
 if __name__ == "__main__":
 
     base_dir = Path(__file__).resolve().parent
+    project_python = base_dir / ".venv/bin/python"
+    if project_python.is_file() and os.path.abspath(sys.executable) != str(project_python):
+        os.execv(str(project_python), [str(project_python), str(Path(__file__).resolve()), *sys.argv[1:]])
 
     parser = argparse.ArgumentParser(
         description="HWP/HWPX 문서를 파싱"
