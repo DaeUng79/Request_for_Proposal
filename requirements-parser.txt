@@ -1,0 +1,4 @@
+pyhwpxlib==0.18.3
+# MongoDB wire version 7 서버 호환
+pymongo==4.13.2
+python-dotenv==1.2.4

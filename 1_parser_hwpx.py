@@ -6,6 +6,9 @@ import zipfile
 import argparse
 import os
 import sys
+import hashlib
+import mimetypes
+from collections import Counter
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,21 @@ HC = "http://www.hancom.co.kr/hwpml/2011/core"
 PIC_TAG = f"{{{HP}}}pic"
 IMG_TAG = f"{{{HC}}}img"
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*-?\s*(\d+)\s*-?\s*$")
+PARSER_VERSION = "2.0.0"
+SCHEMA_VERSION = 2
+
+
+def text_content(node) -> str:
+    """혼합 XML의 text/tail과 탭·줄바꿈을 보존한다."""
+    if node.tag == f"{{{HP}}}tab":
+        return "\t"
+    if node.tag == f"{{{HP}}}lineBreak":
+        return "\n"
+    if node.tag in {f"{{{HP}}}tbl", PIC_TAG, f"{{{HP}}}subList"}:
+        return ""
+    return (node.text or "") + "".join(
+        text_content(child) + (child.tail or "") for child in node
+    )
 
 
 def text_from_cell(cell) -> str:
@@ -28,16 +46,8 @@ def text_from_cell(cell) -> str:
 
     paragraphs = []
 
-    for p in cell.findall(f".//{{{HP}}}subList/{{{HP}}}p"):
-        parts = []
-
-        for node in p.iter():
-            if node.tag == f"{{{HP}}}lineBreak":
-                parts.append("\n")
-            elif node.tag == f"{{{HP}}}t":
-                parts.append(node.text or "")
-
-        value = "".join(parts).strip()
+    for p in cell.findall(f"./{{{HP}}}subList/{{{HP}}}p"):
+        value = text_content(p).strip()
 
         if value:
             paragraphs.append(value)
@@ -91,18 +101,12 @@ def parse_image(
 
     shape_comment = pic.find(f"{{{HP}}}shapeComment")
     description = "".join(shape_comment.itertext()).strip() if shape_comment is not None else ""
-    extension = Path(source_path).suffix if source_path else ""
-    image_path = (
-        f"output/images/{binary_item_id}{extension}"
-        if binary_item_id
-        else f"output/images/{image_id}"
-    )
 
     return {
         "image_id": image_id,
         "source_path": source_path,
         "binary_item_id": binary_item_id,
-        "image_path": image_path,
+        "image_path": None,
         "page_number": page_number,
         "physical_page_number": physical_page_number,
         "page_number_source": page_number_source,
@@ -203,7 +207,8 @@ def parse_table(
 
     return {
         "table_id": table_id,
-        "image_path": f"output/tables/{table_id}.png",
+        "image_path": None,
+        "render_status": "not_rendered",
         "page_number": page_number,
         "physical_page_number": physical_page_number,
         "page_number_source": page_number_source,
@@ -227,6 +232,8 @@ def add_table_context(document: dict[str, Any], context_size: int = 3) -> None:
             for candidate in blocks[:index]
             if candidate["type"] == "paragraph"
             and candidate["section"] == block["section"]
+            and candidate.get("parent_block_id") == block.get("parent_block_id")
+            and candidate.get("parent_cell_id") == block.get("parent_cell_id")
         ][-context_size:]
 
         after = [
@@ -234,6 +241,8 @@ def add_table_context(document: dict[str, Any], context_size: int = 3) -> None:
             for candidate in blocks[index + 1:]
             if candidate["type"] == "paragraph"
             and candidate["section"] == block["section"]
+            and candidate.get("parent_block_id") == block.get("parent_block_id")
+            and candidate.get("parent_cell_id") == block.get("parent_cell_id")
         ][:context_size]
 
         block["context_before"] = before
@@ -413,7 +422,8 @@ def parse_rendered_table(
             for row in sorted(cells_by_row)]
     return {
         "table_id": table_id,
-        "image_path": f"output/tables/{table_id}.png",
+        "image_path": None,
+        "render_status": "not_rendered",
         "page_number": page_number,
         "physical_page_number": physical_page_number,
         "page_number_source": "page_number_field" if page_number is not None else "page_number_unavailable",
@@ -564,203 +574,202 @@ def parse_hwp(path: str | Path) -> dict[str, Any]:
     return document
 
 
-def parse_hwpx(path: str | Path) -> dict[str, Any]:
-
+def parse_hwpx(
+    path: str | Path, *, output_dir: str | Path | None = None,
+    paginate: bool = True, strict_pagination: bool = False,
+) -> dict[str, Any]:
+    """원본 계층을 유지하면서 문단, 표, 셀 내부 그림을 한 번씩 추출한다."""
     path = Path(path)
-
+    document_id = hashlib.sha256(path.read_bytes()).hexdigest()
+    asset_dir = Path(output_dir or Path(__file__).resolve().parent / "output") / "images" / document_id
     document = {
-        "filename": path.name,
-        "blocks": [],
-        "tables": [],
-        "images": [],
+        "document_id": document_id, "source_sha256": document_id,
+        "filename": path.name, "schema_version": SCHEMA_VERSION,
+        "parser_version": PARSER_VERSION,
+        "blocks": [], "tables": [], "images": [], "assets": [],
+        "warnings": [], "pages": [], "pagination_source": "unavailable",
     }
+    counts: Counter = Counter()
+    assets = {}
 
-    with zipfile.ZipFile(path, "r") as z:
+    def warn(code, **details):
+        document["warnings"].append({"code": code, **details})
 
-        header = ET.fromstring(z.read("Contents/header.xml"))
-        border_fill_colors = parse_border_fill_colors(header)
-        zip_names = set(z.namelist())
+    with zipfile.ZipFile(path) as archive:
+        # 압축 해제 폭증을 파싱 전에 제한한다. 이미지도 직접 읽고 지정 경로에만 쓴다.
+        members = archive.infolist()
+        if len(members) > 10000 or sum(i.file_size for i in members) > 512 * 1024 * 1024:
+            raise ValueError("HWPX 압축 해제 크기 또는 항목 수 제한을 초과했습니다.")
+        zip_names = set(archive.namelist())
+        colors = {}
+        fills = {}
+        if "Contents/header.xml" in zip_names:
+            header = ET.fromstring(archive.read("Contents/header.xml"))
+            colors = parse_border_fill_colors(header)
+            for fill in header.iter(f"{{{HH}}}borderFill"):
+                brush = fill.find(f"{{{HC}}}fillBrush")
+                fills[fill.get("id")] = {
+                    "fill_types": [n.tag.rsplit("}", 1)[-1] for n in brush] if brush is not None else [],
+                    "source_xml": ET.tostring(fill, encoding="unicode"),
+                }
+        else:
+            warn("missing_header")
+        manifest = {}
+        if "Contents/content.hpf" in zip_names:
+            package = ET.fromstring(archive.read("Contents/content.hpf"))
+            for item in package.iter():
+                if item.tag.rsplit("}", 1)[-1] == "item":
+                    href = item.get("href", "").removeprefix("./")
+                    manifest[item.get("id")] = (href, item.get("media-type"))
 
-        section_files = section_files_in_order(z.namelist())
-
-        block_index = 0
-        table_index = 0
-        image_index = 0
-        source_paragraph_offset = 0
-        physical_page_number = None
-        page_number = None
-        page_number_source = "page_number_unavailable"
-
+        section_files = section_files_in_order(zip_names)
+        if not section_files:
+            raise ValueError("HWPX 구역 XML을 찾을 수 없습니다.")
+        paragraph_offset = 0
         for section_file in section_files:
-
-            xml_data = z.read(section_file)
-
-            root = ET.fromstring(xml_data)
+            root = ET.fromstring(archive.read(section_file))
             sec = root if root.tag == f"{{{HS}}}sec" else root.find(f".//{{{HS}}}sec")
-
             if sec is None:
+                warn("missing_section_root", section=section_file)
                 continue
+            locations = {}
 
-            direct_paragraphs = sec.findall(f"./{{{HP}}}p")
-            source_paragraph_indices = {}
-            for index, paragraph in enumerate(direct_paragraphs):
-                # 중첩 표도 바깥 본문 문단의 페이지를 상속한다.
-                for descendant in paragraph.iter(f"{{{HP}}}p"):
-                    source_paragraph_indices[descendant] = source_paragraph_offset + index
-            paragraphs = []
+            def locate(node, location):
+                locations[node] = location
+                siblings = Counter()
+                for child in node:
+                    local = child.tag.rsplit("}", 1)[-1]
+                    siblings[local] += 1
+                    locate(child, f"{location}/{local}[{siblings[local]}]")
 
-            for paragraph in sec.iter(f"{{{HP}}}p"):
-                has_table = any(
-                    run.findall(f"{{{HP}}}tbl")
-                    for run in paragraph.findall(f"./{{{HP}}}run")
-                )
+            locate(sec, "/sec[1]")
 
-                if paragraph in direct_paragraphs or has_table:
-                    paragraphs.append(paragraph)
+            def base(kind, node, source_index, parent_block, parent_cell):
+                counts[kind] += 1
+                prefix = {"paragraph": "p", "table": "tbl", "image": "img"}[kind]
+                return {
+                    "block_id": f"{prefix}_{counts[kind]:04d}", "type": kind,
+                    "order": len(document["blocks"]), "section": section_file,
+                    "source_paragraph_index": source_index,
+                    "source_xml_path": locations[node],
+                    "parent_block_id": parent_block, "parent_cell_id": parent_cell,
+                    "page_number": None, "physical_page_number": None,
+                    "page_number_source": "page_number_unavailable",
+                    "physical_page_numbers": [], "page_numbers": [],
+                    "page_mapping_level": "paragraph",
+                }
 
-            for p in paragraphs:
-                paragraph_parts = []
+            def parse_paragraph(p, source_index, parent_block=None, parent_cell=None):
+                created = []
+                parts = []
+                runs = []
+
+                def flush():
+                    value = "".join(parts).strip()
+                    if value:
+                        block = base("paragraph", p, source_index, parent_block, parent_cell)
+                        block.update(text=value, runs=list(runs),
+                                     paragraph_style_id=p.get("styleIDRef"),
+                                     paragraph_properties_id=p.get("paraPrIDRef"))
+                        document["blocks"].append(block)
+                        created.append(block["block_id"])
+                    parts.clear()
+                    runs.clear()
+
+                def visit(node, char_style=None):
+                    if node.tag == f"{{{HP}}}run":
+                        char_style = node.get("charPrIDRef")
+                    if node.tag in {f"{{{HP}}}t", f"{{{HP}}}tab", f"{{{HP}}}lineBreak"}:
+                        value = text_content(node)
+                        parts.append(value)
+                        runs.append({"text": value, "char_properties_id": char_style})
+                        return
+                    if node.tag == f"{{{HP}}}tbl":
+                        flush()
+                        block = base("table", node, source_index, parent_block, parent_cell)
+                        table = parse_table(node, block["block_id"], colors, None, None, "page_number_unavailable")
+                        block.update(table=table, table_index=counts["table"])
+                        document["blocks"].append(block)
+                        document["tables"].append(table)
+                        created.append(block["block_id"])
+                        for tr, row in zip(node.findall(f"./{{{HP}}}tr"), table["cells"]):
+                            for tc, cell in zip(tr.findall(f"./{{{HP}}}tc"), row):
+                                cell["size_unit"] = "hwpunit"
+                                cell["fill"] = fills.get(cell["border_fill_id"])
+                                cell["child_block_ids"] = []
+                                for cp in tc.findall(f"./{{{HP}}}subList/{{{HP}}}p"):
+                                    cell["child_block_ids"].extend(parse_paragraph(
+                                        cp, source_index, block["block_id"], cell["cell_id"]
+                                    ))
+                        return
+                    if node.tag == PIC_TAG:
+                        flush()
+                        block = base("image", node, source_index, parent_block, parent_cell)
+                        img = node.find(f".//{IMG_TAG}")
+                        binary_id = img.get("binaryItemIDRef") if img is not None else None
+                        source, mime = manifest.get(binary_id, (None, None))
+                        if source not in zip_names:
+                            source = find_binary_path(zip_names, binary_id)
+                        picture = parse_image(node, block["block_id"], None, None,
+                                              "page_number_unavailable", source)
+                        picture.update(asset_id=None, extraction_status="missing_binary", size_unit="hwpunit")
+                        if source:
+                            data = archive.read(source)
+                            digest = hashlib.sha256(data).hexdigest()
+                            suffix = Path(source).suffix.lower()
+                            if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                                suffix = ".bin"
+                            asset_dir.mkdir(parents=True, exist_ok=True)
+                            target = asset_dir / f"{digest}{suffix}"
+                            target.write_bytes(data)
+                            picture.update(asset_id=digest, image_path=str(target.resolve()), extraction_status="extracted")
+                            assets[digest] = {
+                                "asset_id": digest, "sha256": digest, "kind": "image",
+                                "mime_type": mime or mimetypes.guess_type(source)[0] or "application/octet-stream",
+                                "byte_size": len(data), "local_path": str(target.resolve()),
+                            }
+                        else:
+                            warn("missing_image_binary", block_id=block["block_id"])
+                        block.update(image=picture, image_index=counts["image"],
+                                     image_path=picture["image_path"], text=picture["description"])
+                        document["blocks"].append(block)
+                        document["images"].append(picture)
+                        created.append(block["block_id"])
+                        return
+                    if node.tag == f"{{{HP}}}subList":
+                        flush()
+                        for cp in node.findall(f"./{{{HP}}}p"):
+                            created.extend(parse_paragraph(cp, source_index, parent_block, parent_cell))
+                        return
+                    # 머리말·꼬리말은 본문 검색에 중복 삽입하지 않는다.
+                    if node.tag in {f"{{{HP}}}header", f"{{{HP}}}footer"}:
+                        return
+                    for child in node:
+                        visit(child, char_style)
 
                 for run in p.findall(f"./{{{HP}}}run"):
+                    visit(run)
+                flush()
+                return created
 
-                    for child in run:
+            direct = sec.findall(f"./{{{HP}}}p")
+            for index, paragraph in enumerate(direct):
+                parse_paragraph(paragraph, paragraph_offset + index)
+            paragraph_offset += len(direct)
 
-                        if child.tag == f"{{{HP}}}t":
-                            paragraph_parts.append(child.text or "")
-
-                        elif child.tag == f"{{{HP}}}lineBreak":
-                            paragraph_parts.append("\n")
-
-                        elif child.tag == f"{{{HP}}}tbl":
-
-                            text = "".join(paragraph_parts).strip()
-                            if text:
-                                block_index += 1
-                                document["blocks"].append(
-                                    {
-                                        "block_id": f"p_{block_index:04d}",
-                                        "type": "paragraph",
-                                        "section": section_file,
-                                        "text": text,
-                                        "source_paragraph_index": source_paragraph_indices.get(p),
-                                        "page_number": page_number,
-                                        "physical_page_number": physical_page_number,
-                                        "page_number_source": page_number_source,
-                                    }
-                                )
-                            paragraph_parts = []
-
-                            table_index += 1
-
-                            table_id = (
-                                f"tbl_{table_index:04d}"
-                            )
-
-                            table = parse_table(
-                                child,
-                                table_id,
-                                border_fill_colors,
-                                page_number,
-                                physical_page_number,
-                                page_number_source,
-                            )
-
-                            block_index += 1
-
-                            block = {
-                                "block_id": table_id,
-                                "type": "table",
-                                "section": section_file,
-                                "table_index": table_index,
-                                "page_number": page_number,
-                                "source_paragraph_index": source_paragraph_indices.get(p),
-                                "physical_page_number": physical_page_number,
-                                "page_number_source": page_number_source,
-                                "table": table,
-                            }
-
-                            document["blocks"].append(block)
-                            document["tables"].append(table)
-
-                        elif child.tag == PIC_TAG:
-
-                            if paragraph_parts:
-                                text = "".join(paragraph_parts).strip()
-                                if text:
-                                    block_index += 1
-                                    document["blocks"].append(
-                                        {
-                                            "block_id": f"p_{block_index:04d}",
-                                            "type": "paragraph",
-                                            "section": section_file,
-                                            "text": text,
-                                            "source_paragraph_index": source_paragraph_indices.get(p),
-                                            "page_number": page_number,
-                                            "physical_page_number": physical_page_number,
-                                            "page_number_source": page_number_source,
-                                        }
-                                    )
-                                paragraph_parts = []
-
-                            image_index += 1
-                            image_id = f"img_{image_index:04d}"
-                            image_node = child.find(f".//{IMG_TAG}")
-                            binary_item_id = (
-                                image_node.get("binaryItemIDRef")
-                                if image_node is not None
-                                else None
-                            )
-                            source_path = find_binary_path(zip_names, binary_item_id)
-                            image = parse_image(
-                                child,
-                                image_id,
-                                page_number,
-                                physical_page_number,
-                                page_number_source,
-                                source_path,
-                            )
-
-                            block_index += 1
-                            block = {
-                                "block_id": image_id,
-                                "type": "image",
-                                "section": section_file,
-                                "text": image["description"],
-                                "image_index": image_index,
-                                "page_number": page_number,
-                                "source_paragraph_index": source_paragraph_indices.get(p),
-                                "physical_page_number": physical_page_number,
-                                "page_number_source": page_number_source,
-                                "image_path": image["image_path"],
-                                "image": image,
-                            }
-                            document["blocks"].append(block)
-                            document["images"].append(image)
-
-                text = "".join(paragraph_parts).strip()
-                if text:
-                    block_index += 1
-                    document["blocks"].append(
-                        {
-                            "block_id": f"p_{block_index:04d}",
-                            "type": "paragraph",
-                            "section": section_file,
-                            "text": text,
-                            "source_paragraph_index": source_paragraph_indices.get(p),
-                            "page_number": page_number,
-                            "physical_page_number": physical_page_number,
-                            "page_number_source": page_number_source,
-                        }
-                    )
-
-            source_paragraph_offset += len(direct_paragraphs)
-
-    page_map, pages = read_rendered_pagination(path)
-    apply_rendered_pagination(document, page_map, pages)
+    document["assets"] = list(assets.values())
+    if paginate:
+        try:
+            page_map, pages = read_rendered_pagination(path)
+            apply_rendered_pagination(document, page_map, pages)
+        except Exception as error:
+            if strict_pagination:
+                raise
+            warn("pagination_failed", error_type=type(error).__name__)
+    else:
+        warn("pagination_disabled")
     add_table_context(document)
-
     return document
-
 
 if __name__ == "__main__":
 
@@ -784,6 +793,14 @@ if __name__ == "__main__":
         default=None,
         help="파싱 결과 JSON 경로",
     )
+    parser.add_argument("--env-file", type=Path, default=base_dir / ".env", help="MongoDB 설정 파일")
+    parser.add_argument("--database", help="MongoDB 데이터베이스명 (설정/URI보다 우선)")
+    parser.add_argument("--collection", default="Request", help="추출 문서 컬렉션명 (기본: Request)")
+    parser.add_argument("--no-mongo", action="store_true", help="MongoDB 저장 없이 로컬 결과만 생성")
+    parser.add_argument("--store-source", action="store_true", help="원본 HWP/HWPX 파일도 GridFS에 저장")
+    parser.add_argument("--no-pagination", action="store_true", help="HWPX 페이지 렌더링 생략")
+    parser.add_argument("--strict-pagination", action="store_true", help="페이지 매핑 실패 시 중단")
+    parser.add_argument("--asset-dir", type=Path, default=base_dir / "output", help="이미지 출력 상위 폴더")
     args = parser.parse_args()
 
     if args.input_path is None:
@@ -800,12 +817,26 @@ if __name__ == "__main__":
     if not input_path.is_file():
         parser.error(f"입력 파일을 찾을 수 없습니다: {input_path}")
 
-    if input_path.suffix.lower() == ".hwp":
-        result = parse_hwp(input_path)
-    elif input_path.suffix.lower() == ".hwpx":
-        result = parse_hwpx(input_path)
-    else:
-        parser.error(f"지원하지 않는 파일 형식입니다: {input_path.suffix}")
+    try:
+        if input_path.suffix.lower() == ".hwp":
+            result = parse_hwp(input_path)
+            digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
+            result.update(document_id=digest, source_sha256=digest,
+                          parser_version=PARSER_VERSION, schema_version=SCHEMA_VERSION,
+                          assets=[], warnings=[{"code": "hwp_render_only",
+                          "detail": "HWP는 병합·음영·이미지 바이너리 추출을 지원하지 않습니다."}])
+            for index, block in enumerate(result["blocks"]):
+                block["order"] = index
+                block["physical_page_numbers"] = [block["physical_page_number"]]
+                block["page_numbers"] = [block["page_number"]]
+        elif input_path.suffix.lower() == ".hwpx":
+            result = parse_hwpx(input_path, output_dir=args.asset_dir,
+                                paginate=not args.no_pagination,
+                                strict_pagination=args.strict_pagination)
+        else:
+            parser.error(f"지원하지 않는 파일 형식입니다: {input_path.suffix}")
+    except Exception as error:
+        parser.exit(1, f"파싱 실패 ({type(error).__name__}). 입력 파일과 렌더링 환경을 확인하세요.\n")
 
     output_json = args.output_json or base_dir / "output/json/parsed.json"
     if not output_json.is_absolute():
@@ -832,3 +863,17 @@ if __name__ == "__main__":
         "표 개수:",
         len(result["tables"])
     )
+    print("블록 개수:", len(result["blocks"]), "이미지 개수:", len(result["images"]))
+    print("파싱 경고:", len(result.get("warnings", [])))
+    if not args.no_mongo:
+        from hwpx_storage import MongoStorageError, save_to_mongodb
+        try:
+            saved = save_to_mongodb(result, input_path, env_path=args.env_file, database=args.database,
+                                    store_source=args.store_source, collection_name=args.collection)
+        except MongoStorageError as error:
+            parser.exit(1, f"{error}\n로컬 JSON은 보존되었습니다.\n")
+        except Exception as error:
+            # 접속 값이나 드라이버 예외 원문을 출력하지 않는다.
+            parser.exit(1, f"MongoDB 저장 실패 ({type(error).__name__}). 로컬 JSON은 보존되었습니다.\n"
+                          ".env의 URI, 네트워크 연결, 데이터베이스 쓰기 권한을 확인하세요.\n")
+        print("MongoDB 저장 완료:", json.dumps(saved, ensure_ascii=False))

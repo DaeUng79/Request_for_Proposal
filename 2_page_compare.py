@@ -33,7 +33,7 @@ def block_pages(block: dict[str, Any]) -> list[int]:
     return sorted({page for page in values if isinstance(page, int) and page > 0})
 
 
-def render_table(block: dict[str, Any]) -> str:
+def render_table(block: dict[str, Any], block_lookup=None) -> str:
     table = block.get("table", block)
     table_id = esc(table.get("table_id", block.get("block_id", "표")))
     page_number = block.get("page_number")
@@ -48,6 +48,9 @@ def render_table(block: dict[str, Any]) -> str:
             rowspan = max(1, int(cell.get("row_span", 1)))
             colspan = max(1, int(cell.get("col_span", 1)))
             text = esc(cell.get("text", "")).replace("\n", "<br>")
+            if block_lookup is not None and cell.get("child_block_ids"):
+                text = "".join(render_block(block_lookup[child_id], block_lookup)
+                               for child_id in cell["child_block_ids"] if child_id in block_lookup)
             cells.append(
                 f'<td rowspan="{rowspan}" colspan="{colspan}"{style}>{text}</td>'
             )
@@ -59,13 +62,13 @@ def render_table(block: dict[str, Any]) -> str:
     )
 
 
-def render_block(block: dict[str, Any]) -> str:
+def render_block(block: dict[str, Any], block_lookup=None) -> str:
     block_type = block.get("type")
     if block_type == "paragraph":
         text = esc(block.get("text", "")).replace("\n", "<br>")
         return f'<p class="paragraph-block">{text}</p>' if text else ""
     if block_type == "table":
-        return render_table(block)
+        return render_table(block, block_lookup)
     if block_type == "image":
         description = block.get("text") or block.get("image", {}).get("description") or "이미지"
         return f'<p class="image-block">{esc(description)}</p>'
@@ -87,8 +90,11 @@ def build_html(
         raise FileNotFoundError(f"SVG 페이지를 찾을 수 없습니다: {svg_dir}")
 
     pages = sorted(svg_files)
+    block_lookup = {block["block_id"]: block for block in document.get("blocks", [])}
     blocks_by_page: dict[int, list[dict[str, Any]]] = {page: [] for page in pages}
     for block in document.get("blocks", []):
+        if block.get("parent_block_id"):
+            continue
         for page in block_pages(block):
             if page in blocks_by_page:
                 blocks_by_page[page].append(block)
@@ -99,7 +105,7 @@ def build_html(
     }
     templates = []
     for page in pages:
-        content = "".join(render_block(block) for block in blocks_by_page[page])
+        content = "".join(render_block(block, block_lookup) for block in blocks_by_page[page])
         if not content:
             content = '<p class="empty">이 페이지에 연결된 파싱 결과가 없습니다.</p>'
         templates.append(
