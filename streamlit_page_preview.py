@@ -54,7 +54,7 @@ def build_page_previews(source: Path) -> dict:
 
 
 def source_parser_path():
-    return Path(__file__).resolve().with_name('1_parser_hwpx.py')
+    return Path(__file__).resolve().with_name('step1_parser_hwpx.py')
 
 
 if __name__ == '__main__':

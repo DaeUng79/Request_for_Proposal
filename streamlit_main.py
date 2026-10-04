@@ -1,4 +1,4 @@
-"""제안요청서 등록 및 조회: .venv/bin/python -m streamlit run streamlit_app.py"""
+"""제안요청서 등록 및 조회: .venv/bin/python -m streamlit run streamlit_main.py"""
 from __future__ import annotations
 
 import copy
@@ -22,8 +22,8 @@ from bson import json_util
 from gridfs import GridFS
 from pymongo import MongoClient
 
-from hwpx_storage import MongoStorageError, mongo_settings, save_to_mongodb
-
+from step2_hwpx_storage import MongoStorageError, mongo_settings, save_to_mongodb
+    
 ROOT = Path(__file__).resolve().parent
 DATABASE = "Request_for_Proposal"
 COLLECTION = "Request"
@@ -49,8 +49,8 @@ def load_page_previews(document):
     if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
         return None
     signature = hashlib.sha256()
-    for name in ("page_preview_worker.py", "1_parser_hwpx.py", "page_number_corrections.json",
-                 "requirements-parser.txt"):
+    for name in ("streamlit_page_preview.py", "step1_parser_hwpx.py", "page_number_corrections.json",
+                 "requirements.txt"):
         path = ROOT / name
         if path.is_file():
             signature.update(path.read_bytes())
@@ -86,7 +86,7 @@ def load_page_previews(document):
         output = Path(temporary) / "pages.json"
         try:
             completed = subprocess.run(
-                [worker_python(), str(ROOT / "page_preview_worker.py"), str(source),
+                [worker_python(), str(ROOT / "streamlit_page_preview.py"), str(source),
                  "--output", str(output)], cwd=ROOT, capture_output=True, timeout=300, check=False)
             if completed.returncode:
                 raise AppError("페이지별 화면을 생성하지 못했습니다. 렌더링 환경을 확인해 주세요.")
@@ -109,7 +109,7 @@ def parse_in_worker(source: Path):
     python = str(project_python) if project_python.is_file() else sys.executable
     with tempfile.TemporaryDirectory(prefix="hwpx-parse-") as temporary:
         output = Path(temporary) / "parsed.json"
-        command = [python, str(ROOT / "1_parser_hwpx.py"), str(source),
+        command = [python, str(ROOT / "step1_parser_hwpx.py"), str(source),
                    "--no-mongo", "--strict-pagination", "--output-json", str(output),
                    "--asset-dir", str(ROOT / "output")]
         try:
@@ -122,7 +122,7 @@ def parse_in_worker(source: Path):
         if completed.returncode != 0:
             # 자식 프로세스 출력에는 경로 등이 포함될 수 있으므로 화면에 그대로 노출하지 않는다.
             raise AppError("파일 파싱에 실패했습니다. 프로젝트 가상환경에 "
-                           "requirements-parser.txt를 설치했는지 확인하고, "
+                           "requirements.txt의 의존성을 설치했는지 확인하고, "
                            "한글에서 문서가 정상적으로 열리는지 확인해 주세요.")
         try:
             return json.loads(output.read_text(encoding="utf-8"))
@@ -130,23 +130,12 @@ def parse_in_worker(source: Path):
             raise AppError("파싱 결과를 읽지 못했습니다. 파일을 다시 등록해 주세요.") from None
 
 
-# @contextmanager
-# def database_connection():
-#     try:
-#         uri, _ = mongo_settings(ROOT / ".env", DATABASE)
-#         with MongoClient(uri, serverSelectionTimeoutMS=7000, connectTimeoutMS=7000,
-#                          socketTimeoutMS=30000, appname="rfp-streamlit") as client:
-#             yield client[DATABASE]
-#     except Exception as error:
-#         raise AppError(f"데이터베이스에 접근하지 못했습니다 ({type(error).__name__}). "
-#                        ".env 설정과 서버 연결을 확인한 뒤 다시 시도해 주세요.") from None
-
 @contextmanager
 def database_connection():
     try:
         # 수동으로 직접 URI 입력
-        # uri = "mongodb://ysgpt2024:ysgpt2024@svc.sel4.cloudtype.app:31286/" #외부에서 접속방법
-        uri = "mongodb://ysgpt2024:ysgpt2024@mongo:27017/" #Cloudtype에 등록된 서비스끼지 접속방법 
+        uri = "mongodb://ysgpt2024:ysgpt2024@svc.sel4.cloudtype.app:31286/" #외부에서 접속방법
+        # uri = "mongodb://ysgpt2024:ysgpt2024@mongo:27017/" #Cloudtype에 등록된 서비스끼지 접속방법 
 
         mongo:27017
         
@@ -519,24 +508,24 @@ def document_view(document):
     st.iframe(markup, height=1000)
 
 
-def show_warnings(document):
-    warnings = document.get("warnings", [])
-    if warnings:
-        with st.expander(f"추출 참고사항 {len(warnings)}건"):
-            labels = {"pagination_failed": "페이지 번호를 확인하지 못했습니다. 본문 추출 결과는 저장됩니다.",
-                      "pagination_disabled": "페이지 번호 추출을 생략했습니다.",
-                      "missing_image_binary": "원본에서 찾지 못한 이미지가 있습니다.",
-                      "hwp_render_only": "HWP는 표 병합·음영과 원본 이미지 추출이 제한됩니다. HWPX 등록을 권장합니다."}
-            for warning in warnings:
-                code = warning.get("code", "unknown")
-                st.write(labels.get(code, f"일부 요소를 확인해 주세요: {code}"))
-
-
 def render_document(document):
     if not document:
         st.info("문서를 찾을 수 없습니다. 저장 목록을 새로고침해 주세요.")
         return
-    st.subheader(display_name(document.get("filename")))
+
+    # 파일명과 다운로드 버튼을 나란히 배치하기 위해 컬럼 분할
+    col_title, col_btn = st.columns([3, 1])
+    with col_title:
+        st.subheader(display_name(document.get("filename")))
+    with col_btn:
+        st.download_button(
+            "추출 결과 JSON 다운로드",
+            json_bytes(document),
+            file_name=Path(display_name(document.get("filename"))).stem + ".json",
+            mime="application/json",
+            key="download_document",
+        )
+
     st.caption(f"저장일 {display_time(document.get('stored_at'))} · 본문 위치는 실제 파일 페이지 기준입니다.")
     blocks = document.get("blocks", [])
     tables = [b for b in blocks if b.get("type") == "table"]
@@ -545,14 +534,11 @@ def render_document(document):
     for col, label, value in zip(cols, ["페이지", "블록", "표", "이미지"],
                                  [len(document.get("pages", [])) or "—", len(blocks), len(tables), len(images)]):
         col.metric(label, value)
-    show_warnings(document)
-    st.download_button("추출 결과 JSON 다운로드", json_bytes(document),
-                       file_name=Path(display_name(document.get("filename"))).stem + ".json",
-                       mime="application/json", key="download_document")
+
     if not blocks:
         st.info("이 문서는 현재 파서의 본문 구조가 없습니다. JSON 다운로드에서 저장 내용을 확인할 수 있습니다.")
         return
-    view = st.radio("보기", ["문서 보기", "표", "이미지"], horizontal=True, key="detail_view")
+    view = st.radio("보기", ["문서 보기", "표", "이미지"], horizontal=True, key="detail_view", label_visibility="collapsed")
     if view == "문서 보기":
         document_view(document)
     elif view == "표":
@@ -593,7 +579,6 @@ def render_document(document):
         st.download_button("이미지 다운로드", data, file_name=f"{asset_id[:12]}{extension}",
                            mime=asset.get("mime_type") or "application/octet-stream")
 
-
 def clear_upload_feedback():
     st.session_state.pop("pending_save", None)
     st.session_state.pop("saved_upload", None)
@@ -602,7 +587,7 @@ def clear_upload_feedback():
 def register_view():
     # st.subheader("제안요청서 등록")
     with st.container(border=True):
-        uploaded = st.file_uploader("제안요청서 파일 등록", type=["hwpx", "hwp"], key="proposal_upload",
+        uploaded = st.file_uploader("파일 등록", type=["hwpx"], key="proposal_upload",
                                     on_change=clear_upload_feedback,
                                     help="파일당 최대 50 MB. 표와 이미지 보존을 위해 HWPX를 권장합니다.")
         # st.caption("HWPX 최대 50 MB · 같은 파일을 다시 등록하면 기존 문서를 갱신합니다.")

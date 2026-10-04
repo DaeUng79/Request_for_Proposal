@@ -835,7 +835,7 @@ def parse_hwpx(
             if strict_pagination:
                 raise PaginationError(
                     f"페이지 번호 추출에 실패했습니다 ({type(error).__name__}). "
-                    "requirements-parser.txt의 의존성과 렌더링 환경을 확인하세요."
+                    "requirements.txt의 의존성과 렌더링 환경을 확인하세요."
                 ) from error
             warn("pagination_failed", error_type=type(error).__name__)
     else:
@@ -939,7 +939,7 @@ if __name__ == "__main__":
     print("블록 개수:", len(result["blocks"]), "이미지 개수:", len(result["images"]))
     print("파싱 경고:", len(result.get("warnings", [])))
     if not args.no_mongo:
-        from hwpx_storage import MongoStorageError, save_to_mongodb
+        from step2_hwpx_storage import MongoStorageError, save_to_mongodb
         try:
             saved = save_to_mongodb(result, input_path, env_path=args.env_file, database=args.database,
                                     store_source=args.store_source, collection_name=args.collection)

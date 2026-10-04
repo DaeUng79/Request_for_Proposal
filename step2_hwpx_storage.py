@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 #client_db = MongoClient('mongodb://ysgpt2024:ysgpt2024@mongo:27017') #Cloudtype에 등록된 서비스끼지 접속방법 
-# client_db = MongoClient('mongodb://ysgpt2024:ysgpt2024@svc.sel4.cloudtype.app:31286/') #외부에서 접속하는 방법
+#client_db = MongoClient('mongodb://ysgpt2024:ysgpt2024@svc.sel4.cloudtype.app:31286/') #외부에서 접속하는 방법
 
 
 class MongoStorageError(RuntimeError):
