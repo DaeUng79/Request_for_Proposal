@@ -130,16 +130,32 @@ def parse_in_worker(source: Path):
             raise AppError("파싱 결과를 읽지 못했습니다. 파일을 다시 등록해 주세요.") from None
 
 
+# @contextmanager
+# def database_connection():
+#     try:
+#         uri, _ = mongo_settings(ROOT / ".env", DATABASE)
+#         with MongoClient(uri, serverSelectionTimeoutMS=7000, connectTimeoutMS=7000,
+#                          socketTimeoutMS=30000, appname="rfp-streamlit") as client:
+#             yield client[DATABASE]
+#     except Exception as error:
+#         raise AppError(f"데이터베이스에 접근하지 못했습니다 ({type(error).__name__}). "
+#                        ".env 설정과 서버 연결을 확인한 뒤 다시 시도해 주세요.") from None
+
 @contextmanager
 def database_connection():
     try:
-        uri, _ = mongo_settings(ROOT / ".env", DATABASE)
+        # 수동으로 직접 URI 입력
+        # uri = "mongodb://ysgpt2024:ysgpt2024@svc.sel4.cloudtype.app:31286/" #외부에서 접속방법
+        uri = "mongodb://ysgpt2024:ysgpt2024@mongo:27017/" #Cloudtype에 등록된 서비스끼지 접속방법 
+
+        mongo:27017
+        
         with MongoClient(uri, serverSelectionTimeoutMS=7000, connectTimeoutMS=7000,
                          socketTimeoutMS=30000, appname="rfp-streamlit") as client:
             yield client[DATABASE]
     except Exception as error:
         raise AppError(f"데이터베이스에 접근하지 못했습니다 ({type(error).__name__}). "
-                       ".env 설정과 서버 연결을 확인한 뒤 다시 시도해 주세요.") from None
+                       "서버 연결을 확인한 뒤 다시 시도해 주세요.") from None
 
 
 def history_query(search=""):
@@ -539,24 +555,6 @@ def render_document(document):
     view = st.radio("보기", ["문서 보기", "표", "이미지"], horizontal=True, key="detail_view")
     if view == "문서 보기":
         document_view(document)
-    # elif view == "본문":
-    #     pages = sorted({p for b in blocks for p in b.get("physical_page_numbers", []) if p is not None})
-    #     selected_page = st.selectbox("페이지", [None] + pages, format_func=lambda p: "전체 페이지" if p is None else f"{p}쪽")
-    #     search = st.text_input("본문 검색", placeholder="찾을 단어나 문장을 입력하세요")
-    #     candidates = [b for b in blocks if b.get("type") == "paragraph"]
-    #     if selected_page is not None:
-    #         candidates = [b for b in candidates if selected_page in b.get("physical_page_numbers", [])]
-    #     if search:
-    #         term = unicodedata.normalize("NFC", search).casefold()
-    #         candidates = [b for b in candidates if term in unicodedata.normalize("NFC", b.get("text", "")).casefold()]
-    #     st.caption(f"문단 {len(candidates):,}개 · 표 안의 문단도 포함합니다.")
-    #     if not candidates:
-    #         st.info("조건에 맞는 문단이 없습니다.")
-    #         return
-    #     part = st.number_input("문단 목록 페이지", min_value=1, max_value=max(1, math.ceil(len(candidates) / 30)), step=1)
-    #     for block in candidates[(part - 1) * 30:part * 30]:
-    #         st.caption(page_label(block) + (" · 표 안의 내용" if block.get("parent_cell_id") else ""))
-    #         st.text(block.get("text", ""))
     elif view == "표":
         if not tables:
             st.info("추출된 표가 없습니다.")
@@ -657,71 +655,6 @@ def register_view():
             st.rerun()
 
 
-# def history_view():
-#     """사이드바에서 문서를 검색·선택하고, 최초 접속 시 최신 문서를 선택한다."""
-#     st.subheader("저장 이력")
-#     if st.session_state.get("deleted_document_name"):
-#         st.success(f"문서를 삭제했습니다: {st.session_state.pop('deleted_document_name')}")
-#     search = st.text_input("파일명 검색", placeholder="제안요청서 이름으로 검색", key="history_search")
-#     st.button("새로고침", key="refresh_history")
-#     if st.session_state.get("previous_search") != search:
-#         st.session_state.history_page = 1
-#         st.session_state.previous_search = search
-#     page = int(st.session_state.get("history_page", 1))
-#     try:
-#         rows, total, page = load_history(search, page)
-#     except AppError as error:
-#         st.error(str(error))
-#         return False
-#     st.session_state.history_page = page
-#     st.caption(f"총 {total:,}개 문서 · 최근 저장 순")
-#     if rows:
-#         if not st.session_state.get("selected_document"):
-#             st.session_state.selected_document = rows[0]["_id"]
-#         options = {row["_id"]: f"{display_name(row.get('filename'))} · {display_time(row.get('stored_at'))}" for row in rows}
-#         ids = list(options)
-#         selected = st.session_state.get("selected_document")
-#         choice = st.selectbox("열람할 문서", ids, index=ids.index(selected) if selected in ids else 0,
-#                               format_func=options.get, key=f"history_choice_{page}_{search}")
-#         if st.session_state.get("pending_delete_document") != choice:
-#             st.session_state.pop("pending_delete_document", None)
-#         actions = st.columns(2)
-#         if actions[0].button("문서 열기", type="primary", key="open_document"):
-#             st.session_state.selected_document = choice
-#         if actions[1].button("문서 삭제", key="delete_document"):
-#             st.session_state.pending_delete_document = choice
-#         if st.session_state.get("pending_delete_document") == choice:
-#             name = display_name(next(row.get("filename") for row in rows if row["_id"] == choice))
-#             st.warning(f"‘{name}’ 문서와 저장된 추출 데이터를 삭제할까요? 되돌릴 수 없습니다.")
-#             confirm, cancel = st.columns(2)
-#             if confirm.button("삭제 확인", type="primary", key="confirm_delete_document"):
-#                 try:
-#                     delete_document(choice)
-#                 except AppError as error:
-#                     st.error(str(error))
-#                 else:
-#                     if st.session_state.get("selected_document") == choice:
-#                         st.session_state.pop("selected_document", None)
-#                     if st.session_state.get("saved_upload", {}).get("document_id") == choice:
-#                         st.session_state.pop("saved_upload", None)
-#                     st.session_state.pop("pending_delete_document", None)
-#                     st.session_state.deleted_document_name = name
-#                     st.rerun()
-#             if cancel.button("취소", key="cancel_delete_document"):
-#                 st.session_state.pop("pending_delete_document", None)
-#                 st.rerun()
-#         # nav = st.columns([1, 2, 1])
-#         # if nav[0].button("이전", disabled=page <= 1):
-#         #     st.session_state.history_page = page - 1
-#         #     st.rerun()
-#         # nav[1].caption(f"{page} / {max(1, math.ceil(total / PAGE_SIZE))} 페이지")
-#         # if nav[2].button("다음", disabled=page * PAGE_SIZE >= total):
-#         #     st.session_state.history_page = page + 1
-#         #     st.rerun()
-#     elif search:
-#         st.info("검색 결과가 없습니다.")
-#     return True
-
 def history_view():
     """사이드바에서 문서를 검색·선택하고, 최초 접속 시 최신 문서를 선택한다."""
     st.subheader("저장 이력")
@@ -786,9 +719,9 @@ def main():
     with st.sidebar:
         st.markdown("### 제안요청서 보관함")
         register_view()
-        st.divider()
+        # st.divider()
         history_loaded = history_view()
-    st.title("심사임당 몇점이GO")
+    st.title("심사임당 & 몇점이GO 문서파싱 결과")
     if st.session_state.get("selected_document"):
         try:
             document = load_document(st.session_state.selected_document)
