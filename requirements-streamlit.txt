@@ -1,2 +1,0 @@
--r requirements-parser.txt
-streamlit==1.65.0

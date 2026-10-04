@@ -1,3 +1,4 @@
+streamlit==1.65.0
 pyhwpxlib==0.18.3
 # HWP/HWPX 실제 페이지 렌더링에 필요
 wasmtime==49.0.0
