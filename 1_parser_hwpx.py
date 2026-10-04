@@ -21,8 +21,9 @@ HC = "http://www.hancom.co.kr/hwpml/2011/core"
 PIC_TAG = f"{{{HP}}}pic"
 IMG_TAG = f"{{{HC}}}img"
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*-?\s*(\d+)\s*-?\s*$")
-PARSER_VERSION = "2.0.0"
+PARSER_VERSION = "2.1.0"
 SCHEMA_VERSION = 2
+PAGE_NUMBER_CORRECTIONS = Path(__file__).resolve().with_name("page_number_corrections.json")
 
 
 def text_content(node) -> str:
@@ -260,22 +261,30 @@ def render_node_text(node: dict[str, Any]) -> str:
     return "".join(render_node_text(child) for child in node.get("children", []))
 
 
-def page_number_from_render_tree(page_tree: dict[str, Any]) -> int | None:
-    """렌더 트리의 바닥글에서 실제 표시되는 쪽번호를 읽는다."""
+def page_number_metadata_from_render_tree(page_tree: dict[str, Any]) -> dict[str, Any]:
+    """머리말·바닥글에 실제 표시되는 쪽번호와 출처를 읽는다."""
 
-    def visit(node: dict[str, Any]):
-        if node.get("type") == "Footer":
+    def visit(node: dict[str, Any], node_type: str):
+        if node.get("type") == node_type:
             yield node
+            return
         for child in node.get("children", []):
-            yield from visit(child)
+            yield from visit(child, node_type)
 
-    for footer in visit(page_tree):
-        # 바닥글에 문서명 등이 함께 있어도 독립된 쪽번호 줄을 읽는다.
-        for line in footer.get("children", []):
-            match = PAGE_NUMBER_PATTERN.fullmatch(render_node_text(line).strip())
-            if match:
-                return int(match.group(1))
-    return None
+    for region_type, source in (("Footer", "rendered_footer"), ("Header", "rendered_header")):
+        for region in visit(page_tree, region_type):
+            # 중간 컨테이너가 있어도 독립된 줄만 검사해 문서명과 섞지 않는다.
+            for line in visit(region, "TextLine"):
+                match = PAGE_NUMBER_PATTERN.fullmatch(render_node_text(line).strip())
+                if match:
+                    return {"page_number": int(match.group(1)), "page_number_source": source}
+    # 표시되지 않은 표지 번호를 물리 페이지 번호로 대체하지 않는다.
+    return {"page_number": None, "page_number_source": "page_number_unavailable"}
+
+
+def page_number_from_render_tree(page_tree: dict[str, Any]) -> int | None:
+    """기존 호출자를 위해 인쇄된 쪽번호만 반환한다."""
+    return page_number_metadata_from_render_tree(page_tree)["page_number"]
 
 
 def section_files_in_order(names) -> list[str]:
@@ -298,6 +307,10 @@ def rendered_section_index(document, page_index: int) -> int:
         return int(json.loads(engine._mem_read(ptr, length))["sectionIndex"])
     finally:
         document._wb_free(engine._store, ptr, length, 1)
+
+
+class PaginationError(RuntimeError):
+    """페이지 추출 실패로 불완전한 결과의 저장을 중단한다."""
 
 
 def read_rendered_pagination(
@@ -329,11 +342,9 @@ def read_rendered_pagination(
             tree = renderer.get_page_render_tree(page_index)
             section_index = rendered_section_index(renderer, page_index)
             section_offset = offsets[section_index]
-            printed_number = page_number_from_render_tree(tree)
             pages.append({
                 "physical_page_number": physical_page,
-                "page_number": printed_number,
-                "page_number_source": "rendered_footer" if printed_number is not None else "page_number_unavailable",
+                **page_number_metadata_from_render_tree(tree),
             })
 
             def collect(node):
@@ -355,6 +366,59 @@ def read_rendered_pagination(
         if rendered_document is None:
             renderer.close()
     return page_map, pages
+
+
+def correct_page_numbers(path, document_id, page_map, pages):
+    """사용자가 확인한 번호 기준을 동일한 원본 해시에만 적용한다.
+
+    물리 페이지 경계는 수정하지 않는다. XML의 명시적 번호 재시작 이후에는
+    이전 기준을 전파하지 않으며 숨겨진 쪽번호는 계속 null로 보존한다.
+    """
+    if not PAGE_NUMBER_CORRECTIONS.is_file():
+        return None
+    settings = json.loads(PAGE_NUMBER_CORRECTIONS.read_text(encoding="utf-8"))
+    correction = settings.get(document_id)
+    if correction is None:
+        return None
+    anchor = correction["physical_page_number"]
+    number = correction["page_number"]
+    if (type(anchor) is not int or type(number) is not int
+            or anchor < 1 or number < 1):
+        raise ValueError("쪽번호 보정 기준은 1 이상의 정수여야 합니다.")
+    lookup = {p["physical_page_number"]: p for p in pages}
+    if anchor not in lookup or lookup[anchor]["page_number"] is None:
+        raise ValueError("쪽번호 보정 기준 페이지에 표시된 번호가 없습니다.")
+
+    # 명시적으로 번호를 다시 시작하는 지점에서는 보정을 중단한다.
+    restart_pages = set()
+    with zipfile.ZipFile(path) as archive:
+        offset = 0
+        for name in section_files_in_order(archive.namelist()):
+            root = ET.fromstring(archive.read(name))
+            section = root if root.tag == f"{{{HS}}}sec" else root.find(f".//{{{HS}}}sec")
+            if section is None:
+                continue
+            paragraphs = section.findall(f"./{{{HP}}}p")
+            for index, paragraph in enumerate(paragraphs):
+                controls = paragraph.findall(f"./{{{HP}}}run/{{{HP}}}ctrl/{{{HP}}}newNum")
+                starts = paragraph.findall(f"./{{{HP}}}run/{{{HP}}}secPr/{{{HP}}}startNum")
+                restarts = any(n.get("numType") == "PAGE" for n in controls)
+                restarts |= any(int(n.get("page", "0")) > 0 for n in starts)
+                mapped = page_map.get(offset + index, [])
+                if restarts and mapped:
+                    restart_pages.add(mapped[0])
+            offset += len(paragraphs)
+    stop = min((p for p in restart_pages if p > anchor), default=float("inf"))
+    delta = number - lookup[anchor]["page_number"]
+    for page in pages:
+        physical = page["physical_page_number"]
+        if anchor <= physical < stop and page["page_number"] is not None:
+            page["rendered_page_number"] = page["page_number"]
+            page["page_number"] += delta
+            page["page_number_source"] = "verified_number_correction"
+    return {"physical_page_number": anchor, "page_number": number,
+            "source": "user_verified", "scope": "printed_numbers_only",
+            "detail": correction.get("detail", "")}
 
 
 def apply_rendered_pagination(
@@ -576,7 +640,7 @@ def parse_hwp(path: str | Path) -> dict[str, Any]:
 
 def parse_hwpx(
     path: str | Path, *, output_dir: str | Path | None = None,
-    paginate: bool = True, strict_pagination: bool = False,
+    paginate: bool = True, strict_pagination: bool = True,
 ) -> dict[str, Any]:
     """원본 계층을 유지하면서 문단, 표, 셀 내부 그림을 한 번씩 추출한다."""
     path = Path(path)
@@ -761,10 +825,18 @@ def parse_hwpx(
     if paginate:
         try:
             page_map, pages = read_rendered_pagination(path)
+            correction = correct_page_numbers(path, document_id, page_map, pages)
+            if correction is not None:
+                document["page_number_correction"] = correction
+                warn("rendered_layout_not_verified",
+                     detail="인쇄 쪽번호의 시작 기준만 보정했습니다. 물리 페이지 경계와 전체 쪽수는 렌더러 계산값이며 원본 대조가 필요합니다.")
             apply_rendered_pagination(document, page_map, pages)
         except Exception as error:
             if strict_pagination:
-                raise
+                raise PaginationError(
+                    f"페이지 번호 추출에 실패했습니다 ({type(error).__name__}). "
+                    "requirements-parser.txt의 의존성과 렌더링 환경을 확인하세요."
+                ) from error
             warn("pagination_failed", error_type=type(error).__name__)
     else:
         warn("pagination_disabled")
@@ -799,7 +871,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-mongo", action="store_true", help="MongoDB 저장 없이 로컬 결과만 생성")
     parser.add_argument("--store-source", action="store_true", help="원본 HWP/HWPX 파일도 GridFS에 저장")
     parser.add_argument("--no-pagination", action="store_true", help="HWPX 페이지 렌더링 생략")
-    parser.add_argument("--strict-pagination", action="store_true", help="페이지 매핑 실패 시 중단")
+    parser.add_argument("--strict-pagination", action=argparse.BooleanOptionalAction, default=True,
+                        help="페이지 매핑 실패 시 중단 (기본값). --no-strict-pagination으로 부분 추출 허용")
     parser.add_argument("--asset-dir", type=Path, default=base_dir / "output", help="이미지 출력 상위 폴더")
     args = parser.parse_args()
 

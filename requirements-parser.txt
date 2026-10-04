@@ -1,4 +1,6 @@
 pyhwpxlib==0.18.3
+# HWP/HWPX 실제 페이지 렌더링에 필요
+wasmtime==49.0.0
 # MongoDB wire version 7 서버 호환
 pymongo==4.13.2
 python-dotenv==1.2.4
