@@ -118,8 +118,33 @@ python step1_parser_hwpx.py input/example.hwpx --no-mongo
 
 `--no-mongo`를 생략하면 JSON 생성 후 MongoDB에도 저장합니다. 주요 옵션은 `--output-json`, `--asset-dir`, `--database`, `--collection`, `--env-file`, `--no-pagination`, `--strict-pagination` 및 `--no-strict-pagination`입니다. 파싱 전용 사용은 `--no-mongo`를 지정합니다.
 
-저장 모듈은 `.env` 또는 환경 변수의 `MONGODB_URI`, `MONGO_URI`, `client_db` 설정을 사용하며 데이터베이스 이름은 `--database` 또는 `MONGODB_DATABASE` 등으로 지정합니다. 접속 URI는 소스 코드나 공개 문서에 비밀값과 함께 기록하지 마세요.
+### MongoDB 연결 설정
+
+저장과 Streamlit 조회는 `step2_hwpx_storage.py`의 `mongo_settings()`를 통해 MongoDB URI를 가져옵니다. 우선순위는 `MONGODB_URI` → `MONGO_URI` → `client_db`이며, 같은 이름의 값이 있으면 프로세스 환경변수가 `.env` 파일 값보다 우선합니다.
+
+- **로컬 실행:** 프로젝트 루트의 `.env` 파일에 `MONGODB_URI`를 설정할 수 있습니다. `python-dotenv`가 읽으므로 값의 따옴표를 사용할 수 있습니다.
+- **웹 배포:** 호스팅 서비스의 앱 환경변수/Secrets에 `MONGODB_URI`를 등록합니다. 저장소에 `download.env` 같은 파일을 올리는 것만으로는 해당 값이 프로세스 환경변수로 자동 등록되지 않습니다. 배포 서비스에서 환경변수를 주입하거나 파일명을 `.env`로 만들어 앱 루트에 배치해야 합니다.
+- `rootusername`, `rootpassword` 같은 별도 변수는 현재 코드가 URI에 자동으로 결합하지 않습니다. 인증정보를 포함한 전체 접속 URI를 `MONGODB_URI` 하나에 지정합니다.
+
+URI 형식은 다음과 같습니다. 실제 사용자명·비밀번호·주소를 README나 Git 저장소에 기록하지 마세요.
+
+```text
+mongodb://<사용자명>:<URL-인코딩된-비밀번호>@<호스트>:<포트>/<데이터베이스>?authSource=<인증-DB>
+```
+
+클라우드 플랫폼의 MongoDB를 사용할 때는 앱에서 접근 가능한 주소를 지정해야 합니다. 플랫폼 내부 네트워크의 `mongo:27017` 같은 주소는 같은 내부 네트워크에 연결된 서비스에서만 작동할 수 있습니다. 외부에서 접속할 경우 플랫폼이 제공하는 외부 호스트와 포트를 사용하세요. 비밀번호에 `@`, `:`, `/`, `#`, `%` 등이 포함되면 URI 사용자정보 부분에서 URL 인코딩해야 합니다.
+
+Streamlit은 `DATABASE = "Request_for_Proposal"`을 명시적으로 전달하므로, Streamlit 연결의 DB 이름은 `MONGODB_DATABASE`가 아니라 이 상수로 정해집니다. CLI에서는 `--database`가 우선이며, 지정하지 않으면 `MONGODB_DATABASE` 또는 URI의 DB 이름, 마지막으로 `Request_for_Proposal`을 사용합니다. 환경변수를 변경한 뒤에는 웹서비스를 재시작/재배포해야 적용됩니다.
+
+### 접속이 되지 않을 때
+
+1. 배포 서비스의 실행 로그에서 `ValueError`인지 `MongoStorageError`인지 확인합니다. 설정값 누락·잘못된 URI 형식은 MongoDB 연결 전에 실패하며, 네트워크·인증·권한 문제는 연결/저장 단계에서 발생합니다.
+2. `MONGODB_URI`가 `mongodb://` 또는 `mongodb+srv://`로 시작하는지, 호스트·포트·사용자 인증정보가 맞는지 확인합니다. `mongo:27017`은 배포 네트워크 외부에서 접근하는 주소가 아닐 수 있습니다.
+3. MongoDB 서비스의 가동 상태, 앱에서 DB로 나가는 네트워크 허용 여부, 대상 DB에서 컬렉션/인덱스를 만들고 읽고 쓸 권한이 있는지 확인합니다.
+4. HTTP 503이 웹앱 주소 접속 시 나타나면 앱 호스팅/게이트웨이 문제일 수 있고, 저장 요청에서만 보이면 앱 로그의 MongoDB 저장 단계와 DB 서비스 로그를 함께 확인합니다. 상태 코드만으로 어느 서비스가 503을 반환했는지 단정할 수 없습니다.
+
+접속 URI, 비밀번호, API 키는 소스 코드·README·공개 저장소에 기록하지 말고 배포 플랫폼의 비밀 환경변수로 관리하세요. 자격증명이 이미 Git이나 공개 채팅에 노출됐다면 즉시 교체하세요.
 
 ## 설정 주의
 
-파서와 Streamlit은 `step1_parser_hwpx.py`, `step2_hwpx_storage.py`, `requirements.txt`를 기준으로 동작합니다. MongoDB 접속 URI는 소스 코드에 직접 넣지 말고 환경 변수 또는 `.env`에서 관리하세요.
+앱의 파일 배치는 이 README의 파일 목록을 기준으로 합니다. 로컬에서는 루트 `.env`, 배포에서는 플랫폼 환경변수 `MONGODB_URI`를 사용하고, 실제 값은 저장소에 커밋하지 마세요.

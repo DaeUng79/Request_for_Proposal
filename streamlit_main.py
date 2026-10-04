@@ -133,15 +133,11 @@ def parse_in_worker(source: Path):
 @contextmanager
 def database_connection():
     try:
-        # 수동으로 직접 URI 입력
-        uri = "mongodb://ysgpt2024:ysgpt2024@svc.sel4.cloudtype.app:31286/" #외부에서 접속방법
-        # uri = "mongodb://ysgpt2024:ysgpt2024@mongo:27017/" #Cloudtype에 등록된 서비스끼지 접속방법 
-
-        mongo:27017
-        
-        with MongoClient(uri, serverSelectionTimeoutMS=7000, connectTimeoutMS=7000,
-                         socketTimeoutMS=30000, appname="rfp-streamlit") as client:
-            yield client[DATABASE]
+        uri, database = mongo_settings(ROOT / ".env", DATABASE)
+        with MongoClient(uri, serverSelectionTimeoutMS=10000, connectTimeoutMS=10000,
+                         socketTimeoutMS=60000, appname="rfp-streamlit") as client:
+            client.admin.command("ping")
+            yield client[database]
     except Exception as error:
         raise AppError(f"데이터베이스에 접근하지 못했습니다 ({type(error).__name__}). "
                        "서버 연결을 확인한 뒤 다시 시도해 주세요.") from None
