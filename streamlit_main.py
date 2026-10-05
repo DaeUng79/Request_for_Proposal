@@ -691,7 +691,7 @@ def render_requirements(document):
     if not document.get("active_revision"):
         st.info("이 문서는 파싱 버전 정보가 없습니다. 원본 파일을 다시 등록한 뒤 제안 요구사항을 추출해 주세요.")
         return
-    st.caption("gpt-4o-mini로 총괄표와 세부내역의 위치를 찾고, 해당 원문을 그대로 가져옵니다. "
+    st.caption("gpt-4o로 총괄표와 세부내역의 위치를 찾고, 해당 원문을 그대로 가져옵니다. "
                "추출 버튼을 누를 때만 API를 사용하며 저장된 결과는 다시 사용할 수 있습니다.")
     state_key = requirements_state_key(document)
     widget_key = hashlib.sha256("\0".join(state_key).encode("utf-8")).hexdigest()[:20]
@@ -741,7 +741,7 @@ def render_requirements(document):
             key=f"requirements_download_{widget_key}", disabled=result is None)
     if result is not None:
         usage = result.get("usage", {})
-        metadata = f"추출일 {display_time(result.get('created_at'))} · 모델 {result.get('model', 'gpt-4o-mini')}"
+        metadata = f"추출일 {display_time(result.get('created_at'))} · 모델 {result.get('model', 'gpt-4o')}"
         if usage.get("total_tokens") is not None:
             metadata += f" · 사용 토큰 {usage['total_tokens']:,}"
         st.caption(metadata)
