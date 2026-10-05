@@ -21,7 +21,7 @@ HC = "http://www.hancom.co.kr/hwpml/2011/core"
 PIC_TAG = f"{{{HP}}}pic"
 IMG_TAG = f"{{{HC}}}img"
 PAGE_NUMBER_PATTERN = re.compile(r"^\s*-?\s*(\d+)\s*-?\s*$")
-PARSER_VERSION = "2.1.0"
+PARSER_VERSION = "2.1.1"
 SCHEMA_VERSION = 2
 PAGE_NUMBER_CORRECTIONS = Path(__file__).resolve().with_name("page_number_corrections.json")
 
@@ -32,6 +32,11 @@ def text_content(node) -> str:
         return "\t"
     if node.tag == f"{{{HP}}}lineBreak":
         return "\n"
+    if node.tag == f"{{{HP}}}fieldBegin" and node.get("type") == "FORMULA":
+        # 수식 필드의 자식에는 formula/format/LastResult 메타데이터가 들어 있다.
+        # 실제 표시·계산 결과는 필드 뒤의 일반 hp:t 노드에 있으므로 메타데이터는
+        # 본문 텍스트에서 제외하고 그 결과 텍스트만 보존한다.
+        return ""
     if node.tag in {f"{{{HP}}}tbl", PIC_TAG, f"{{{HP}}}subList"}:
         return ""
     return (node.text or "") + "".join(

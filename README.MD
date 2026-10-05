@@ -8,6 +8,7 @@
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------ |
 | [step1_parser_hwpx.py](step1_parser_hwpx.py)           | HWPX/HWP 파싱, 블록·표·이미지·페이지 메타데이터 생성, JSON 출력 및 저장 모듈 호출 |
 | [step2_hwpx_storage.py](step2_hwpx_storage.py)         | JSON에서 저장 레코드와 검색용 청크 생성, MongoDB/GridFS 저장                         |
+| [step3_ai_requirements.py](step3_ai_requirements.py)   | 저장 문서의 요구사항 총괄표·목록표·세부내역 원문 추출과 버전별 저장                |
 | [streamlit_main.py](streamlit_main.py)                 | (파싱결과 확인용) 문서 업로드·등록, 저장 이력 및 상세 보기 UI                       |
 | [streamlit_page_preview.py](streamlit_page_preview.py) | (파싱결과 확인용) )원본 한글 파일을 페이지별 SVG로 렌더링하는 별도 프로세스 작업자  |
 | [requirements.txt](requirements.txt)                   | 앱·파서 실행에 필요한 Python 의존성                                                 |
@@ -25,7 +26,7 @@ HWPX 원본
   └─ 구조화 JSON 생성
 ```
 
-HWPX는 ZIP 안의 XML을 직접 읽기 때문에 표 셀 좌표와 병합 정보, 셀 안의 문단·중첩 표·그림 관계를 보존합니다. 렌더 트리의 문단 위치를 XML 문단과 연결해 페이지 정보를 추가합니다. 
+HWPX는 ZIP 안의 XML을 직접 읽기 때문에 표 셀 좌표와 병합 정보, 셀 안의 문단·중첩 표·그림 관계를 보존합니다. 렌더 트리의 문단 위치를 XML 문단과 연결해 페이지 정보를 추가합니다.
 
 ### JSON의 주요 구조
 
@@ -70,6 +71,7 @@ CLI 기본 JSON 경로는 `output/json/parsed.json`입니다.  이미지 출력�
 | `hwpx_blocks`                             | 문단·표·그림 블록별 레코드. 문서 순서 조회 인덱스 포함                          |
 | `hwpx_assets`                             | 이미지 자산 메타데이터 및 GridFS 참조                                             |
 | `hwpx_chunks`                             | 검색용 텍스트 청크와 원본 블록/셀 참조. 임베딩은 생성하지 않음                    |
+| `RequestRequirements`                     | 원본 문서 ID·파싱 버전과 연결된 요구사항 추출 결과, 출처 블록, 모델·토큰 사용량 |
 | `hwpx_files.files`, `hwpx_files.chunks` | GridFS 바이너리. 이미지와 선택적으로 저장한 원본 파일                             |
 
 블록·자산·청크 레코드의 `_id`는 `{document_id}:{revision}:{block_id|asset_id|chunk_id}` 형태입니다. `Request._id`는 원본 `document_id`입니다. `Request`에는 전체 문서를 바로 열 수 있도록 블록과 자산이 함께 있고, 보조 컬렉션에는 개별 조회·검색을 위한 정규화된 사본이 있습니다.
@@ -86,6 +88,7 @@ CLI 기본 JSON 경로는 `output/json/parsed.json`입니다.  이미지 출력�
 - **저장 재시도:** 파싱이 끝난 뒤 DB 저장에 실패하면 파싱 결과를 세션 상태에 보관하고, 재시도 또는 JSON 다운로드를 제공합니다.
 - **이력:** `Request`에서 저장 문서를 최근 순으로 조회하고 문서를 열거나 삭제할 수 있습니다.
 - **상세 보기:** 페이지별 문서 보기, 표 보기, 이미지 보기, JSON 다운로드를 제공합니다. 본문 문자열은 HTML escape 처리 후 렌더링합니다.
+- **문서별 탭:** `제안요청서`에서 전체 문서를, `제안 요구사항`에서 총괄표·목록표와 세부내역을 확인합니다. 추출 버튼을 눌렀을 때만 OpenAI API를 호출하며 저장 결과를 다시 열 때는 호출하지 않습니다.
 - **원본 미리보기:** 원본 파일이 로컬 업로드 폴더나 GridFS에 있으면 페이지 미리보기를 생성·재사용합니다. 원본이 없으면 저장된 블록으로 대체 표시하되 페이지별 정확한 배치는 보장할 수 없습니다.
 
 ## 4. `streamlit_page_preview.py`의 역할
@@ -114,8 +117,40 @@ streamlit run streamlit_main.py
 - **로컬 실행:** 프로젝트 루트의 `.env` 파일에 `MONGODB_URI`를 설정할 수 있습니다. `python-dotenv`가 읽으므로 값의 따옴표를 사용할 수 있습니다.
 - **웹 배포:**  인증정보를 포함한 전체 접속 URI를 `MONGODB_URI` 하나에 지정합니다.
 
-URI 형식은 다음과 같습니다. 
+URI 형식은 다음과 같습니다.
 
 ```text
 mongodb://<사용자명>:<URL-인코딩된-비밀번호>@<호스트>:<포트>/<데이터베이스>?authSource=<인증-DB>
+```
+
+## 5. 요구사항 원문 추출 — `step3_ai_requirements.py`
+
+프로젝트 `.env` 또는 환경변수에 `OPENAI_API_KEY`를 설정합니다. 환경변수가 우선하며, 키는 화면·로그·추출 결과에 저장하지 않습니다. 기본 모델은 `gpt-4o`입니다. (`gpt-4o-mini로는 충분한 결과도출 불가`)
+
+1. DB `Request`의 현재 `active_revision`에 해당하는 파싱 JSON을 읽습니다.
+2. 문서 전체의 문단·표를 비용을 줄인 JSON으로 나누어 보냅니다. 중복 셀 문단·스타일·이미지 바이너리는 제외하며, 긴 블록도 생략 없이 분할합니다. 배치 경계의 문맥은 겹쳐 제공합니다.
+3. LLM은 [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)로 총괄표·목록표와 세부내역에 해당하는 **기존 블록 ID만** 반환합니다. 항목명·필드명을 고정하지 않습니다.
+4. 프로그램이 해당 ID의 원본 블록과 하위 문단·표·이미지를 복사합니다. 셀 텍스트, 문단, 줄바꿈, 병합, 순서, 출처 페이지를 그대로 보존합니다. 목록표와 상세표의 표현이 달라도 맞추거나 요약하지 않습니다.
+5. 출처·원문 동일성을 검증하고 `RequestRequirements`에 저장합니다. 원래 `Request`나 파싱 블록은 수정하지 않습니다. 결과는 문서 ID, 원본 revision, 추출기 버전, 모델별로 재사용하며 재파싱 후에는 이전 결과를 표시하지 않습니다. 문서를 삭제하면 연결된 요구사항 결과도 삭제됩니다.
+
+화면 사용: 저장 이력에서 문서 열기 → **제안 요구사항** → **제안 요구사항 추출**. 이후 `총괄표`와 `세부내역` 하위 탭에서 확인하거나 별도의 JSON으로 다운로드합니다. **다시 추출** 버튼은 API를 새로 호출합니다.
+
+CLI에서도 실행할 수 있습니다. 파일명은 일부 일치와 한글 NFC/NFD를 지원하며, 여러 문서가 검색되면 `--document-id`를 사용합니다.
+
+```sh
+# 추출·검증 후 원본 문서에 연결해 저장
+.venv/bin/python step3_ai_requirements.py --filename '특허 빅데이터' --save --output output/requirements.json
+
+# 특정 문서 재추출 (--force 사용 시 새 API 비용 발생)
+.venv/bin/python step3_ai_requirements.py --document-id '<문서 ID>' --save --force
+```
+
+`--save`를 생략하면 DB에 쓰지 않습니다. 저장된 결과가 없으면 API 추출은 수행합니다. JSON에는 `summary`, `details` 각각의 `block_ids`와 원문 `blocks`, `document_id`, `source_revision`, 원문 해시, 추출 시각, `usage`, `warnings`가 들어 있습니다.
+
+원문 보존은 **기존 파싱 JSON 기준**입니다. 기존 파서의 오탈자·수식 문자열도 유지하며 이미지 속 문자는 새로 OCR하지 않습니다. 총괄표/세부내역이 없거나 목록의 요구사항 번호가 세부내역에서 확인되지 않으면 `needs_review`로 표시합니다. 출처가 맞지 않는 AI 응답이나 실패한 배치가 있으면 부분 결과를 저장하지 않습니다. 원문 동일성 검증은 자동으로 수행하지만, 새로운 문서 양식에서 모든 요구사항을 선택했는지는 사용자 확인이 필요할 수 있습니다.
+
+관련 회귀 검증:
+
+```sh
+.venv/bin/python -m unittest test_ai_requirements test_requirements_ui tests.test_document_view -v
 ```

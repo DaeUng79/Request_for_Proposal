@@ -12,3 +12,5 @@ __pycache__/
 *.wav
 .DS_Store
 .streamlit/
+.vscode/
+test_*

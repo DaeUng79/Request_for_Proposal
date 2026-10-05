@@ -250,6 +250,7 @@ def delete_document(document_id):
         file_ids.discard(None)
         for name in ("blocks", "assets", "chunks"):
             db[f"hwpx_{name}"].delete_many({"document_id": document_id})
+        db["RequestRequirements"].delete_many({"document_id": document_id})
         db[COLLECTION].delete_one({"_id": document_id})
         fs = GridFS(db, collection="hwpx_files")
         for file_id in file_ids:
@@ -340,7 +341,8 @@ def table_html(table):
     return '<div class="rfp-table"><table>' + "".join(rendered) + "</table></div>"
 
 
-def build_document_html(document, selected_page=None, image_loader=None, page_previews=None):
+def build_document_html(document, selected_page=None, image_loader=None, page_previews=None,
+                        *, extracted=False):
     """페이지별 렌더링을 우선 표시하며 원본이 없을 때만 저장 블록을 사용한다."""
     import base64
 
@@ -416,8 +418,18 @@ def build_document_html(document, selected_page=None, image_loader=None, page_pr
                 color = str(cell.get("background_color") or "")
                 style = f"background-color:{color};" if re.fullmatch(r"#[a-fA-F0-9]{3,8}", color) else ""
                 children = [lookup[c] for c in cell.get("child_block_ids", []) if c in lookup]
-                content = "".join(render(child, ancestors) for child in children)
-                if not children:
+                raw_text = cell.get("text")
+                if extracted and isinstance(raw_text, str):
+                    # 셀 원문은 자식 문단을 합친 문자열과 다를 수 있다(공백·필드 등).
+                    # 발췌 화면은 저장된 셀 문자열을 우선하고, 그 문자열에 포함되지
+                    # 않는 문단과 중첩 표·이미지는 빠짐없이 추가한다.
+                    content = '<p class="paragraph">' + html.escape(raw_text) + '</p>'
+                    content += "".join(render(child, ancestors) for child in children
+                                       if child.get("type") != "paragraph"
+                                       or child.get("text", "") not in raw_text)
+                else:
+                    content = "".join(render(child, ancestors) for child in children)
+                if not children and not (extracted and isinstance(raw_text, str)):
                     content = '<p class="paragraph">' + html.escape(cell.get("text", "")) + '</p>'
                 cells.append(f'<td rowspan="{rs}" colspan="{cs}" style="{style}">{content}</td>')
             rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -430,7 +442,8 @@ def build_document_html(document, selected_page=None, image_loader=None, page_pr
             ) + '</colgroup>'
         return '<div class="table-wrap"><table>' + columns + ''.join(rows) + '</table></div>'
 
-    top_level = [b for b in blocks if not b.get("parent_block_id")]
+    top_level = [b for b in blocks if not b.get("parent_block_id")
+                 or (extracted and b.get("parent_block_id") not in lookup)]
     groups = {}
     for block in top_level:
         pages = pages_of(block)
@@ -439,6 +452,10 @@ def build_document_html(document, selected_page=None, image_loader=None, page_pr
         p["physical_page_number"] for p in document.get("pages", [])
         if isinstance(p.get("physical_page_number"), int)
     })
+    if extracted:
+        # 발췌 화면은 페이지 복제본이 아니라 원문 블록을 표시한다. 여러 쪽의 표도
+        # 최초 위치에서 전체 구조를 한 번만 보여 주고 원본 페이지 범위를 함께 적는다.
+        page_numbers = sorted(groups)
     if page_previews:
         page_numbers = [p["physical_page_number"] for p in metadata_pages]
     if selected_page is not None:
@@ -453,12 +470,16 @@ def build_document_html(document, selected_page=None, image_loader=None, page_pr
         else:
             page_blocks = groups.get(page, [])
             # 세부 페이지 정보가 없는 표를 첫 페이지에 몰아 놓지 않는다.
-            content = ''.join(render(b) for b in page_blocks if len(pages_of(b)) <= 1)
-            if any(page in pages_of(b) and len(pages_of(b)) > 1 for b in top_level):
+            content = ''.join(render(b) for b in page_blocks if extracted or len(pages_of(b)) <= 1)
+            if not extracted and any(page in pages_of(b) and len(pages_of(b)) > 1 for b in top_level):
                 content += '<p class="notice">페이지별 내용을 표시하려면 원본 파일을 다시 등록해 주세요.</p>'
             if not content:
                 content = '<p class="notice">이 페이지의 추출 내용이 없습니다.</p>'
         label = printed_label(page)
+        if extracted:
+            source_pages = sorted({p for b in groups.get(page, []) for p in pages_of(b)})
+            label = ("원본 파일 " + " · ".join(f"{p}쪽" for p in source_pages)
+                     if source_pages else "원본 페이지 미확인")
         badge = f"<span>{label}</span>" if label else ""
         heading = f"{title} · {label}" if label else title
         footer = f"<footer>— {label} —</footer>" if label else ""
@@ -504,7 +525,7 @@ def document_view(document):
     st.iframe(markup, height=1000)
 
 
-def render_document(document):
+def render_proposal_document(document):
     if not document:
         st.info("문서를 찾을 수 없습니다. 저장 목록을 새로고침해 주세요.")
         return
@@ -574,6 +595,169 @@ def render_document(document):
         extension = Path(picture.get("source_path") or "image.bin").suffix
         st.download_button("이미지 다운로드", data, file_name=f"{asset_id[:12]}{extension}",
                            mime=asset.get("mime_type") or "application/octet-stream")
+
+
+def load_requirements_result(document):
+    """저장 결과 조회는 API를 호출하지 않는다. 화면에서 쉽게 대체 가능한 경계."""
+    from step3_ai_requirements import RequirementsError, load_saved_requirements
+
+    try:
+        return load_saved_requirements(document, env_path=ROOT / ".env",
+                                       database=DATABASE, collection_name=COLLECTION)
+    except RequirementsError as error:
+        raise AppError(str(error)) from None
+
+
+def extract_requirements_result(document, *, force=False, progress=None):
+    from step3_ai_requirements import RequirementsError, extract_and_save_requirements
+
+    try:
+        return extract_and_save_requirements(
+            document.get("_id") or document.get("document_id"), env_path=ROOT / ".env",
+            database=DATABASE, collection_name=COLLECTION, force=force, progress=progress)
+    except RequirementsError as error:
+        raise AppError(str(error)) from None
+
+
+def requirements_state_key(document):
+    """같은 이름의 다른 파일과 재등록된 버전의 결과를 섞지 않는다."""
+    return (str(document.get("_id") or document.get("document_id")),
+            str(document.get("active_revision")))
+
+
+def requirements_match_document(result, document):
+    return bool(result and document.get("active_revision")
+                and str(result.get("document_id")) == requirements_state_key(document)[0]
+                and str(result.get("source_revision")) == requirements_state_key(document)[1])
+
+
+def build_requirements_html(document, result):
+    """총괄표를 먼저 보여주고 상세 원문은 요구사항별 페이지 정보와 함께 접어 둔다."""
+    from step3_ai_requirements import group_detail_items
+
+    def reader_fragment(blocks):
+        if not blocks:
+            return "", '<p class="notice">추출된 원문이 없습니다.</p>'
+        excerpt = {"filename": document.get("filename"), "blocks": blocks,
+                   "assets": document.get("assets", [])}
+        markup = build_document_html(excerpt, image_loader=load_image, extracted=True)
+        style = markup.split("<style>", 1)[1].split("</style>", 1)[0]
+        content = markup.split('<div class="reader">', 1)[1].rsplit("</div></body></html>", 1)[0]
+        return style, content
+
+    summary_blocks = result.get("summary", {}).get("blocks", [])
+    base_style, summary_content = reader_fragment(summary_blocks)
+    sections = [
+        '<section class="requirements-section"><h2>1. 요구사항 총괄표</h2>',
+        summary_content,
+        '</section><section class="requirements-section"><h2>2. 요구사항별 구분</h2>',
+    ]
+    groups = group_detail_items(document, result.get("details", {}))
+    if not groups:
+        sections.append('<p class="notice">추출된 요구사항 세부내역이 없습니다.</p>')
+    for index, group in enumerate(groups, 1):
+        style, content = reader_fragment(group["blocks"])
+        if not base_style:
+            base_style = style
+        pages = " · ".join(f"{page}쪽" for page in group["pages"]) or "페이지 미확인"
+        sections.append(
+            '<details class="requirement-item"><summary>'
+            f'<strong>{index}. {html.escape(group["label"])}</strong>'
+            f'<span class="requirement-pages">원문 페이지 {html.escape(pages)}</span>'
+            f'</summary>{content}</details>'
+        )
+    sections.append("</section>")
+    extra_style = """
+.requirements-section > h2 {font:700 20px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;
+ color:#1e293b;border-bottom:2px solid #94a3b8;padding:12px 4px;margin:24px auto 16px;max-width:210mm;}
+.requirement-item {max-width:210mm;margin:0 auto 12px;border:1px solid #cbd5e1;border-radius:10px;
+ background:#fff;overflow:hidden;}
+.requirement-item > summary {display:flex;align-items:center;justify-content:space-between;gap:12px;
+ cursor:pointer;padding:14px 18px;font:600 15px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;}
+.requirement-pages {color:#475569;font-size:13px;white-space:nowrap;}
+.requirement-item[open] > summary {border-bottom:1px solid #e2e8f0;background:#f8fafc;}
+.requirement-item .reader {padding:10px;}
+@media(max-width:650px) {.requirement-item > summary {align-items:flex-start;flex-direction:column;gap:4px;}}
+"""
+    return ('<!doctype html><html lang="ko"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1"><style>'
+            + base_style + extra_style + '</style></head><body><div class="reader">'
+            + "".join(sections) + "</div></body></html>")
+
+
+def render_requirements(document):
+    st.subheader("제안 요구사항")
+    st.caption(display_name(document.get("filename")))
+    if not document.get("active_revision"):
+        st.info("이 문서는 파싱 버전 정보가 없습니다. 원본 파일을 다시 등록한 뒤 제안 요구사항을 추출해 주세요.")
+        return
+    st.caption("gpt-4o-mini로 총괄표와 세부내역의 위치를 찾고, 해당 원문을 그대로 가져옵니다. "
+               "추출 버튼을 누를 때만 API를 사용하며 저장된 결과는 다시 사용할 수 있습니다.")
+    state_key = requirements_state_key(document)
+    widget_key = hashlib.sha256("\0".join(state_key).encode("utf-8")).hexdigest()[:20]
+    cache = st.session_state.setdefault("requirements_results", {})
+    controls = st.columns([1, 1.2, 1.2], gap="small")
+    with controls[0]:
+        refresh_clicked = st.button("저장 공간 새로고침", key=f"requirements_refresh_{widget_key}")
+    if refresh_clicked:
+        cache.pop(state_key, None)
+    if state_key not in cache:
+        try:
+            cache[state_key] = load_requirements_result(document)
+        except AppError as error:
+            st.error(str(error))
+        except Exception:
+            st.error("저장된 제안 요구사항을 불러오지 못했습니다. 연결 상태를 확인하고 새로고침해 주세요.")
+    result = cache.get(state_key)
+    if result is not None and not requirements_match_document(result, document):
+        cache.pop(state_key, None)
+        result = None
+        st.info("현재 파싱 버전과 일치하지 않는 저장 결과를 표시하지 않았습니다. 제안 요구사항을 다시 추출해 주세요.")
+    force = result is not None
+    button_label = "제안 요구사항 다시 추출" if force else "제안 요구사항 추출"
+    with controls[1]:
+        if st.button(button_label, type="primary", key=f"requirements_extract_{widget_key}"):
+            with st.status("제안 요구사항을 추출하고 있습니다…", expanded=True) as status:
+                try:
+                    extracted = extract_requirements_result(document, force=force, progress=st.write)
+                    if not requirements_match_document(extracted, document):
+                        raise AppError("추출 중 문서가 갱신되었습니다. 저장 이력에서 문서를 다시 열어 주세요.")
+                    result = extracted
+                    cache[state_key] = result
+                    status.update(label="추출 결과를 저장했습니다", state="complete", expanded=False)
+                except AppError as error:
+                    status.update(label="추출을 완료하지 못했습니다", state="error")
+                    st.error(str(error))
+                except Exception:
+                    status.update(label="추출을 완료하지 못했습니다", state="error")
+                    st.error("제안 요구사항 추출에 실패했습니다. API 설정과 데이터베이스 연결을 확인해 주세요.")
+    if result is None:
+        st.info("현재 문서에 저장된 제안 요구사항 추출 결과가 없습니다.")
+    with controls[2]:
+        st.download_button(
+            "제안 요구사항 JSON 다운로드", json_bytes(result) if result is not None else b"",
+            mime="application/json",
+            file_name=Path(display_name(document.get("filename"))).stem + "_제안요구사항.json",
+            key=f"requirements_download_{widget_key}", disabled=result is None)
+    if result is not None:
+        usage = result.get("usage", {})
+        metadata = f"추출일 {display_time(result.get('created_at'))} · 모델 {result.get('model', 'gpt-4o-mini')}"
+        if usage.get("total_tokens") is not None:
+            metadata += f" · 사용 토큰 {usage['total_tokens']:,}"
+        st.caption(metadata)
+        st.iframe(build_requirements_html(document, result), height=1000)
+
+
+def render_document(document):
+    if not document:
+        st.info("문서를 찾을 수 없습니다. 저장 목록을 새로고침해 주세요.")
+        return
+    proposal_tab, requirements_tab = st.tabs(["제안요청서", "제안 요구사항"])
+    with proposal_tab:
+        render_proposal_document(document)
+    with requirements_tab:
+        render_requirements(document)
+
 
 def clear_upload_feedback():
     st.session_state.pop("pending_save", None)
@@ -679,6 +863,10 @@ def history_view():
                         st.session_state.pop("selected_document", None)
                     if st.session_state.get("saved_upload", {}).get("document_id") == choice:
                         st.session_state.pop("saved_upload", None)
+                    requirements_cache = st.session_state.get("requirements_results", {})
+                    for key in list(requirements_cache):
+                        if key[0] == str(choice):
+                            requirements_cache.pop(key, None)
                     st.session_state.pop("pending_delete_document", None)
                     st.session_state.deleted_document_name = name
                     st.rerun()
@@ -689,14 +877,6 @@ def history_view():
 
 def main():
     st.set_page_config(page_title="제안요청서 보관함", page_icon="📄", layout="wide")
-    # st.markdown("""<style>
-    # .block-container {max-width:1180px;padding-top:2.4rem;padding-bottom:4rem;}
-    # h1 {letter-spacing:-.04em;} h2,h3 {letter-spacing:-.025em;}
-    # [data-testid="stMetric"] {background:#f3f6fb;border:1px solid #e3e9f2;border-radius:12px;padding:16px;}
-    # .rfp-table {overflow:auto;max-height:650px;border:1px solid #dbe3ef;border-radius:10px;}
-    # .rfp-table table {border-collapse:collapse;width:100%;font-size:14px;}
-    # .rfp-table td {border:1px solid #dbe3ef;padding:12px;vertical-align:top;white-space:pre-wrap;min-width:90px;}
-    # </style>""", unsafe_allow_html=True)
     with st.sidebar:
         st.markdown("### 제안요청서 보관함")
         register_view()
