@@ -1,6 +1,6 @@
 .venv/
 .streamlit/
-.doc/
+.참고자료/
 tests/
 output/
 # 파이썬 캐시 무시

@@ -251,6 +251,7 @@ def delete_document(document_id):
         for name in ("blocks", "assets", "chunks"):
             db[f"hwpx_{name}"].delete_many({"document_id": document_id})
         db["RequestRequirements"].delete_many({"document_id": document_id})
+        db["RequestCriteria"].delete_many({"document_id": document_id})
         db[COLLECTION].delete_one({"_id": document_id})
         fs = GridFS(db, collection="hwpx_files")
         for file_id in file_ids:
@@ -619,6 +620,26 @@ def extract_requirements_result(document, *, force=False, progress=None):
         raise AppError(str(error)) from None
 
 
+def load_criteria_result(document):
+    from step4_ai_criteria import CriteriaError, load_saved_criteria
+
+    try:
+        return load_saved_criteria(document, env_path=ROOT / ".env", database=DATABASE)
+    except CriteriaError as error:
+        raise AppError(str(error)) from None
+
+
+def extract_criteria_result(document, *, force=False, progress=None):
+    from step4_ai_criteria import CriteriaError, extract_and_save_criteria
+
+    try:
+        return extract_and_save_criteria(
+            document.get("_id") or document.get("document_id"), env_path=ROOT / ".env",
+            database=DATABASE, force=force, progress=progress)
+    except CriteriaError as error:
+        raise AppError(str(error)) from None
+
+
 def requirements_state_key(document):
     """같은 이름의 다른 파일과 재등록된 버전의 결과를 섞지 않는다."""
     return (str(document.get("_id") or document.get("document_id")),
@@ -685,6 +706,40 @@ def build_requirements_html(document, result):
             + "".join(sections) + "</div></body></html>")
 
 
+def build_criteria_html(document, result):
+    """생성한 JSON 기준표를 제안요구사항 화면과 같은 문서형 표로 표시한다."""
+    headings = ["평가부문(배점)", "평가항목", "평가기준", "평가요소", "배점"]
+    rows = [[{"row": 0, "col": col, "row_span": 1, "col_span": 1,
+              "text": heading, "background_color": "#e8edf3"}
+             for col, heading in enumerate(headings)]]
+    for row_index, item in enumerate(result.get("rows", []), 1):
+        division = str(item.get("evaluation_division", ""))
+        division_score = item.get("division_score")
+        if division_score is not None:
+            division += f" ({division_score}점)"
+        values = [division, str(item.get("evaluation_item", "")),
+                  str(item.get("evaluation_criteria", "")),
+                  "\n".join(f"• {element}" for element in item.get("evaluation_elements", [])),
+                  f"{item.get('score', 0)}점"]
+        rows.append([{"row": row_index, "col": col, "row_span": 1, "col_span": 1,
+                      "text": value} for col, value in enumerate(values)])
+    final_index = len(rows)
+    rows.append([{"row": final_index, "col": 0, "row_span": 1, "col_span": 4,
+                  "text": "총 계", "background_color": "#f1f5f9"},
+                 {"row": final_index, "col": 4, "row_span": 1, "col_span": 1,
+                  "text": f"{result.get('total_score', 0)}점", "background_color": "#f1f5f9"}])
+    source_label = ("제안요청서 내 평가기준표를 참고하여 생성" if result.get("template_source")
+                   == "request_document" else "doc/ai_criteria.md의 기본 평가기준을 적용해 생성")
+    blocks = [
+        {"block_id": "criteria-title", "type": "paragraph", "text": "정성적 평가기준표"},
+        {"block_id": "criteria-source", "type": "paragraph", "text": source_label},
+        {"block_id": "criteria-table", "type": "table",
+         "table": {"cells": rows, "row_count": len(rows), "col_count": len(headings)}},
+    ]
+    return build_document_html({"filename": display_name(document.get("filename")),
+                                "blocks": blocks}, extracted=True)
+
+
 def render_requirements(document):
     st.subheader("제안 요구사항")
     st.caption(display_name(document.get("filename")))
@@ -748,15 +803,87 @@ def render_requirements(document):
         st.iframe(build_requirements_html(document, result), height=1000)
 
 
+def render_criteria(document):
+    st.subheader("정성적 지표 평가기준표")
+    st.caption("제안요청서에 정성적 평가기준표가 있으면 해당 항목·배점을 우선 사용하고, 없으면 doc/ai_criteria.md를 참고해 생성합니다.")
+    if not document.get("active_revision"):
+        st.info("평가기준표를 만들려면 먼저 파싱된 제안요청서를 등록해 주세요.")
+        return
+
+    state_key = requirements_state_key(document)
+    requirement_cache = st.session_state.setdefault("requirements_results", {})
+    requirement_result = requirement_cache.get(state_key)
+    if not requirements_match_document(requirement_result, document):
+        st.info("평가기준표를 만들기 전에 ‘제안 요구사항’ 탭에서 요구사항을 추출해 저장해 주세요.")
+        return
+
+    requirements_content = json.dumps(
+        [requirement_result.get("summary"), requirement_result.get("details")],
+        ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    requirements_digest = hashlib.sha256(requirements_content.encode("utf-8")).hexdigest()
+    criteria_key = (state_key, str(requirement_result.get("_id", "")), requirements_digest)
+    cache = st.session_state.setdefault("criteria_results", {})
+    controls = st.columns([1, 1.2, 1.2], gap="small")
+    with controls[0]:
+        refresh_clicked = st.button("저장 공간 새로고침", key=f"criteria_refresh_{hashlib.sha256(repr(criteria_key).encode()).hexdigest()[:20]}")
+    if refresh_clicked:
+        cache.pop(criteria_key, None)
+    if criteria_key not in cache:
+        try:
+            cache[criteria_key] = load_criteria_result(document)
+        except AppError as error:
+            st.error(str(error))
+    result = cache.get(criteria_key)
+    force = result is not None
+    widget_key = hashlib.sha256(repr(criteria_key).encode("utf-8")).hexdigest()[:20]
+    with controls[1]:
+        label = "평가기준표 다시 생성" if force else "정성적 평가기준표 생성"
+        if st.button(label, type="primary", key=f"criteria_generate_{widget_key}"):
+            with st.status("평가기준 서식과 제안 요구사항을 반영해 표를 생성하고 있습니다…", expanded=True) as status:
+                try:
+                    generated = extract_criteria_result(document, force=force, progress=st.write)
+                    if (str(generated.get("document_id")) != state_key[0]
+                            or str(generated.get("source_revision")) != state_key[1]
+                            or generated.get("source_requirements_id") != requirement_result.get("_id")):
+                        raise AppError("생성 중 원본 요구사항이 변경되었습니다. 문서를 다시 열어 주세요.")
+                    result = generated
+                    cache[criteria_key] = result
+                    status.update(label="평가기준표를 생성·저장했습니다", state="complete", expanded=False)
+                except AppError as error:
+                    status.update(label="생성을 완료하지 못했습니다", state="error")
+                    st.error(str(error))
+                except Exception:
+                    status.update(label="생성을 완료하지 못했습니다", state="error")
+                    st.error("평가기준표 생성에 실패했습니다. API 설정과 데이터베이스 연결을 확인해 주세요.")
+    with controls[2]:
+        st.download_button(
+            "평가기준표 JSON 다운로드", json_bytes(result) if result is not None else b"",
+            mime="application/json",
+            file_name=Path(display_name(document.get("filename"))).stem + "_정성적평가기준.json",
+            key=f"criteria_download_{widget_key}", disabled=result is None)
+    if result is None:
+        st.info("현재 문서에 저장된 평가기준표가 없습니다. 생성 버튼을 눌러 GPT-4o로 작성할 수 있습니다.")
+        return
+
+    usage = result.get("usage", {})
+    st.caption(f"총 배점 {result.get('total_score', 0)}점 · 평가항목 {len(result.get('rows', []))}개 · "
+               f"모델 {result.get('model', 'gpt-4o')} · 생성일 {display_time(result.get('created_at'))} · "
+               f"사용 토큰 {usage.get('total_tokens', 0):,}")
+    st.iframe(build_criteria_html(document, result), height=1000)
+
+
 def render_document(document):
     if not document:
         st.info("문서를 찾을 수 없습니다. 저장 목록을 새로고침해 주세요.")
         return
-    proposal_tab, requirements_tab = st.tabs(["제안요청서", "제안 요구사항"])
+    proposal_tab, requirements_tab, criteria_tab = st.tabs(
+        ["제안요청서", "제안 요구사항", "정성적 평가기준"])
     with proposal_tab:
         render_proposal_document(document)
     with requirements_tab:
         render_requirements(document)
+    with criteria_tab:
+        render_criteria(document)
 
 
 def clear_upload_feedback():
